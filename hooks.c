@@ -1,10 +1,32 @@
 /*
   Copyright (C) 2015  Stefan Sundin
+  Copyright (C) 2019  Tobias Leutwein
 
   This program is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
   the Free Software Foundation, either version 3 of the License, or
   (at your option) any later version.
+
+
+
+
+Anzahl Buttons:
+	GetSystemMetrics( SM_CMOUSEBUTTONS )
+
+Maus mit Rad
+	GetSystemMetrics( SM_MOUSEWHEELPRESENT )
+
+Wenn Maus mit Rad vorhanden
+	xButton benutzen
+sonst
+	3. Maustaste verwenden
+
+
+SystemParametersInfoA
+	SPI_GETMOUSEKEYS
+	SPI_GETMOUSE
+
+
 */
 
 #define UNICODE
@@ -12,6 +34,7 @@
 #define _WIN32_WINNT 0x0600
 #define COBJMACROS
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -31,6 +54,9 @@ GUID my_IID_IAudioEndpointVolume = {0x5CDF2C82,0x841E,0x4546,{0x97,0x22,0x0C,0xF
 // App
 #define APP_NAME L"AltDrag"
 #define AERO_THRESHOLD 5
+
+/** true: Output of log messages regarding scrolling through mouse key pressed moving. */
+#define HOOKS_DBG_SCROLL	true
 
 // Boring stuff
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
@@ -90,8 +116,23 @@ struct {
   struct wnddata *pos;
 } wnddb;
 
+
+// Setting:
+	DWORD		scrollThroughMouseDeltaResetTms_u32 = 3000;	/**< Zeit nach der das gespeicherte Delta in scrollThroughMouseDeltaCur..._i32 geloescht werden soll. */
+	UINT		scrollThroughMouseDeltaOneInc_u = 3;	/**< Mause delta fuer die Meldung von einem Scroll Inkrement. */
+
+
 // State
 struct {
+	bool		scrollThroughMouseMove_b;	/**< true: Scroll ueber Maus Bewegung aktiv. */
+	DWORD		scrollThroughMouseTmsDown_u32;	/**< Fuer Scroll ueber Maus Taste Zeitpunkt [ms] an dem die Taste gedrueckt wurde. */
+	POINT		scrollThroughMousePos_P;	/**< Position auf dem Bildschirm, an der das Scrollen ueber die Maus gestartet wurde und an der sie auch bleiben soll. */
+	LONG		scrollThroughMouseDeltaCurX_i32;	/**< Aktuelles Delta der Maus Bewegung in x-Richtung. Nur wenn Bewegung groesser als scrollThroughMouseDeltaOneInc_u ist, eine Bewegung anfordern. */
+	DWORD		scrollThroughMouseDeltaCurXupdtTms_u32;	/**< Fuer Scroll ueber Maus Taste Zeitpunkt [ms] an dem die Taste gedrueckt wurde. */
+
+	LONG		scrollThroughMouseDeltaCurY_i32;	/**< Aktuelles Delta der Maus Bewegung in x-Richtung. Nur wenn Bewegung groesser als scrollThroughMouseDeltaOneInc_u ist, eine Bewegung anfordern. */
+	DWORD		scrollThroughMouseDeltaCurYupdtTms_u32;	/**< Fuer Scroll ueber Maus Taste Zeitpunkt [ms] an dem die Taste gedrueckt wurde. */
+
   HWND hwnd;
   HWND mdiclient;
   short alt;
@@ -600,8 +641,9 @@ void ResizeSnap(int *posx, int *posy, int *wndwidth, int *wndheight) {
   }
 }
 
-#ifdef _WIN64
 
+#ifdef _WIN64
+/* **************************************************************** */
 // x64 keyhook needs only to check when the shift key is depressed
 __declspec(dllexport) LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
   if (nCode == HC_ACTION) {
@@ -629,6 +671,7 @@ __declspec(dllexport) LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wP
 
 #else
 
+/* **************************************************************** */
 // Get action of button
 int GetAction(int button) {
   if (button == BUTTON_LMB) return sharedsettings.Mouse.LMB;
@@ -639,6 +682,8 @@ int GetAction(int button) {
   return ACTION_NONE;
 }
 
+
+/* **************************************************************** */
 // Check if key is assigned
 int IsHotkey(int key) {
   int i;
@@ -650,6 +695,8 @@ int IsHotkey(int key) {
   return 0;
 }
 
+
+/* **************************************************************** */
 void MouseMove() {
   int posx, posy, wndwidth, wndheight;
 
@@ -948,6 +995,8 @@ void MouseMove() {
   MoveWindow(state.hwnd, posx, posy, wndwidth, wndheight, TRUE);
 }
 
+
+/* **************************************************************** */
 __declspec(dllexport) LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
   if (nCode == HC_ACTION) {
     int vkey = ((PKBDLLHOOKSTRUCT)lParam)->vkCode;
@@ -1117,821 +1166,1275 @@ __declspec(dllexport) LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wP
   return CallNextHookEx(NULL, nCode, wParam, lParam);
 }
 
-__declspec(dllexport) LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
-  if (nCode == HC_ACTION) {
-    // Set up some variables
-    PMSLLHOOKSTRUCT msg = (PMSLLHOOKSTRUCT)lParam;
-    int button =
-      (wParam==WM_LBUTTONDOWN||wParam==WM_LBUTTONUP)?BUTTON_LMB:
-      (wParam==WM_MBUTTONDOWN||wParam==WM_MBUTTONUP)?BUTTON_MMB:
-      (wParam==WM_RBUTTONDOWN||wParam==WM_RBUTTONUP)?BUTTON_RMB:
-      (HIWORD(msg->mouseData)==XBUTTON1)?BUTTON_MB4:
-      (HIWORD(msg->mouseData)==XBUTTON2)?BUTTON_MB5:BUTTON_NONE;
-    enum {STATE_NONE, STATE_DOWN, STATE_UP} buttonstate =
-      (wParam==WM_LBUTTONDOWN||wParam==WM_MBUTTONDOWN||wParam==WM_RBUTTONDOWN||wParam==WM_XBUTTONDOWN)?STATE_DOWN:
-      (wParam==WM_LBUTTONUP||wParam==WM_MBUTTONUP||wParam==WM_RBUTTONUP||wParam==WM_XBUTTONUP)?STATE_UP:STATE_NONE;
-    int action = GetAction(button);
-    POINT pt = msg->pt;
-    // Handle mouse move and scroll
-    if (wParam == WM_MOUSEMOVE) {
-      // Store prevpt so we can check if the hook goes stale
-      state.prevpt = pt;
-      // Move the window
-      if (sharedstate.action == ACTION_MOVE || sharedstate.action == ACTION_RESIZE) {
-        state.updaterate = (state.updaterate+1)%(sharedstate.action==ACTION_MOVE?sharedsettings.Performance.MoveRate:sharedsettings.Performance.ResizeRate);
-        if (state.updaterate == 0) {
-          if (sharedsettings.Performance.Cursor) {
-            MoveWindow(cursorwnd, pt.x-20, pt.y-20, 41, 41, TRUE);
-            //MoveWindow(cursorwnd,(prevpt.x<pt.x?prevpt.x:pt.x)-3,(prevpt.y<pt.y?prevpt.y:pt.y)-3,(pt.x>prevpt.x?pt.x-prevpt.x:prevpt.x-pt.x)+7,(pt.y>prevpt.y?pt.y-prevpt.y:prevpt.y-pt.y)+7,FALSE);
-          }
-          MouseMove();
-        }
-      }
-      // Reset double-click time
-      // Unfortunately, we have to remember the previous pointer position since WM_MOUSEMOVE is sometimes sent even
-      // if the mouse hasn't moved, e.g. when running Windows virtualized or when connecting to a remote desktop.
-      if (pt.x != state.clickpt.x || pt.y != state.clickpt.y) {
-        state.clicktime = 0;
-      }
-    }
-    else if (wParam == WM_MOUSEWHEEL || wParam == WM_MOUSEHWHEEL) {
-      if (state.alt && !sharedstate.action && sharedsettings.Mouse.Scroll && !state.interrupted) {
-        int delta = GET_WHEEL_DELTA_WPARAM(msg->mouseData);
-        if (sharedsettings.Mouse.Scroll == ACTION_ALTTAB) {
-          numhwnds = 0;
 
-          if (sharedsettings.MDI) {
-            HWND hwnd = WindowFromPoint(pt);
-            // Hide if tooltip
-            wchar_t classname[20] = L"";
-            GetClassName(hwnd, classname, ARRAY_SIZE(classname));
-            if (!wcscmp(classname,TOOLTIPS_CLASS)) {
-              ShowWindow(hwnd, SW_HIDE);
-              hwnd = WindowFromPoint(pt);
-            }
-            if (hwnd != NULL) {
-              // Get MDIClient
-              HWND mdiclient = NULL;
-              char classname[100] = "";
-              GetClassNameA(hwnd, classname, ARRAY_SIZE(classname));
-              if (!strcmp(classname,"MDIClient")) {
-                mdiclient = hwnd;
-              }
-              else {
-                while (hwnd != NULL) {
-                  HWND parent = GetParent(hwnd);
-                  LONG_PTR exstyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
-                  if ((exstyle&WS_EX_MDICHILD)) {
-                    mdiclient = parent;
-                    break;
-                  }
-                  hwnd = parent;
-                }
-              }
-              // Enumerate and then reorder MDI windows
-              if (mdiclient != NULL) {
-                hwnd = GetWindow(mdiclient, GW_CHILD);
-                while (hwnd != NULL) {
-                  if (numhwnds == hwnds_alloc) {
-                    hwnds_alloc += 20;
-                    hwnds = realloc(hwnds, hwnds_alloc*sizeof(HWND));
-                  }
-                  hwnds[numhwnds++] = hwnd;
-                  hwnd = GetWindow(hwnd, GW_HWNDNEXT);
-                }
-                if (numhwnds > 1) {
-                  if (delta > 0) {
-                    SendMessage(mdiclient, WM_MDIACTIVATE, (WPARAM) hwnds[numhwnds-1], 0);
-                  }
-                  else {
-                    SetWindowPos(hwnds[0], hwnds[numhwnds-1], 0, 0, 0, 0, SWP_NOACTIVATE|SWP_NOMOVE|SWP_NOSIZE);
-                    SendMessage(mdiclient, WM_MDIACTIVATE, (WPARAM) hwnds[1], 0);
-                  }
-                }
-              }
-            }
-          }
+/* **************************************************************** */
+/**	 The system calls this function every time a new mouse input event is about to be posted into a thread input queue.
 
-          // Enumerate windows
-          if (numhwnds <= 1) {
-            state.origin.monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-            numhwnds = 0;
-            EnumWindows(EnumAltTabWindows, 0);
-            if (numhwnds <= 1) {
-              return CallNextHookEx(NULL, nCode, wParam, lParam);
-            }
-            // Reorder windows
-            if (delta > 0) {
-              SetForegroundWindow(hwnds[numhwnds-1]);
-            }
-            else {
-              SetWindowPos(hwnds[0], hwnds[numhwnds-1], 0, 0, 0, 0, SWP_NOACTIVATE|SWP_NOMOVE|SWP_NOSIZE);
-              SetForegroundWindow(hwnds[1]);
-            }
-          }
+	# Scollen und mittlere Maus Taste
 
-          // Use this to print the windows
-          /*
-          FILE *f = OpenLog(L"ab");
-          fwprintf(f, L"numhwnds: %d\n", numhwnds);
-          wchar_t title[100], classname[100];
-          int k;
-          for (k=0; k < numhwnds; k++) {
-            GetWindowText(hwnds[k], title, ARRAY_SIZE(title));
-            GetClassName(hwnds[k], classname, ARRAY_SIZE(classname));
-            RECT wnd;
-            GetWindowRect(hwnds[k], &wnd);
-            fwprintf(f, L"wnd #%03d (0x%08x): %s [%s] (%dx%d @ %dx%d)\n", k, hwnds[k], title, classname, wnd.right-wnd.left, wnd.bottom-wnd.top, wnd.left, wnd.top);
-          }
-          fwprintf(f, L"\n");
-          CloseLog(f);
-          */
-        }
-        else if (sharedsettings.Mouse.Scroll == ACTION_VOLUME) {
-          IMMDeviceEnumerator *pDevEnumerator = NULL;
-          IMMDevice *pDev = NULL;
-          IAudioEndpointVolume *pAudioEndpoint = NULL;
+	Die mittlere Maus Taste wird wohl hauptsaechlich bei STATE_DOWN verarbeiet - siehe LowerWithMMB.
+	D.h. wenn man erkennt, dass es sich nicht ums scrollen handelt muss man den Button Down nachsenden.
+	-# bei erkennen, dass es sich nicht um eine scroll Anforderung handelt (buttonstate == STATE_UP) den buttonstate auf STATE_DOWN aendern und gleiche ein STATE_UP Event triggern.
 
-          // Get audio endpoint
-          HRESULT hr = CoCreateInstance(&my_CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, &my_IID_IMMDeviceEnumerator, (void**)&pDevEnumerator);
-          if (hr != S_OK) {
-            Error(L"CoCreateInstance(MMDeviceEnumerator)", L"LowLevelMouseProc()", hr);
-            return CallNextHookEx(NULL, nCode, wParam, lParam);
-          }
-          hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(pDevEnumerator, eRender, eMultimedia, &pDev);
-          IMMDeviceEnumerator_Release(pDevEnumerator);
-          if (hr != S_OK) {
-            Error(L"IMMDeviceEnumerator_GetDefaultAudioEndpoint(eRender, eMultimedia)", L"LowLevelMouseProc()", hr);
-            return CallNextHookEx(NULL, nCode, wParam, lParam);
-          }
-          hr = IMMDevice_Activate(pDev, &my_IID_IAudioEndpointVolume, CLSCTX_ALL, NULL, (void**)&pAudioEndpoint);
-          IMMDevice_Release(pDev);
-          if (hr != S_OK) {
-            Error(L"IMMDevice_Activate(IID_IAudioEndpointVolume)", L"LowLevelMouseProc()", hr);
-            return CallNextHookEx(NULL, nCode, wParam, lParam);
-          }
+JournalRecordProc
+JournalPlaybackProc
+CallNextHookEx
 
-          // Function pointer so we only need one for-loop
-          typedef HRESULT WINAPI (*_VolumeStep)(IAudioEndpointVolume*, LPCGUID pguidEventContext);
-          _VolumeStep VolumeStep = (_VolumeStep)(pAudioEndpoint->lpVtbl->VolumeStepDown);
-          if (delta > 0) {
-            VolumeStep = (_VolumeStep)(pAudioEndpoint->lpVtbl->VolumeStepUp);
-          }
+Waere vielleicht besser ueber
+	Raw Input
+		- RAWMOUSE
+Using Raw Input
+https://docs.microsoft.com/de-de/windows/win32/inputdev/using-raw-input
 
-          // Hold shift to make 5 steps
-          int i;
-          int num = (sharedstate.shift)?5:1;
-          for (i=0; i < num; i++) {
-            hr = VolumeStep(pAudioEndpoint, NULL);
-          }
-          IAudioEndpointVolume_Release(pAudioEndpoint);
-          if (hr != S_OK) {
-            Error(L"IAudioEndpointVolume_VolumeStepUp/Down()", L"LowLevelMouseProc()", hr);
-            return CallNextHookEx(NULL, nCode, wParam, lParam);
-          }
-        }
-        else if (sharedsettings.Mouse.Scroll == ACTION_TRANSPARENCY) {
-          HWND hwnd = WindowFromPoint(pt);
-          if (hwnd == NULL) {
-            return CallNextHookEx(NULL, nCode, wParam, lParam);
-          }
-          hwnd = GetAncestor(hwnd, GA_ROOT);
+	\param[in]	nCode	- HC_ACTION: The wParam and lParam parameters contain information about a mouse message.
+						- 0
+						.
+						If nCode is less than zero, the hook procedure must return the value returned by CallNextHookEx.
 
-          LONG_PTR exstyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
-          if (!(exstyle&WS_EX_LAYERED)) {
-            SetWindowLongPtr(hwnd, GWL_EXSTYLE, exstyle|WS_EX_LAYERED);
-            SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
-          }
+						If nCode is greater than or equal to zero, and the hook procedure did not process the message, it is highly recommended that you call CallNextHookEx and return the value it returns; otherwise, other applications that have installed WH_MOUSE_LL hooks will not receive hook notifications and may behave incorrectly as a result. If the hook procedure processed the message, it may return a nonzero value to prevent the system from passing the message to the rest of the hook chain or the target window procedure.
 
-          BYTE old_alpha;
-          DWORD flags;
-          if (GetLayeredWindowAttributes(hwnd,NULL,&old_alpha,&flags) == FALSE) {
-            Error(L"GetLayeredWindowAttributes()", L"LowLevelMouseProc()", GetLastError());
-            return CallNextHookEx(NULL, nCode, wParam, lParam);
-          }
-          int alpha = old_alpha;
+	\param[in]	wParam	The identifier of the mouse message. This parameter can be one of the following messages: WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOUSEHWHEEL, WM_RBUTTONDOWN, or WM_RBUTTONUP.
 
-          int alpha_delta = (sharedstate.shift)?8:64;
-          if (delta > 0) {
-            alpha += alpha_delta;
-            if (alpha > 255) {
-              alpha = 255;
-            }
-          }
-          else {
-            alpha -= alpha_delta;
-            if (alpha < 8) {
-              alpha = 8;
-            }
-          }
-          SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
-        }
-        else if (sharedsettings.Mouse.Scroll == ACTION_LOWER) {
-          HWND hwnd = WindowFromPoint(pt);
-          if (hwnd == NULL) {
-            return CallNextHookEx(NULL, nCode, wParam, lParam);
-          }
-          hwnd = GetAncestor(hwnd, GA_ROOT);
+	\param[in]	lParam	A pointer to an MSLLHOOKSTRUCT struct
 
-          if (delta > 0) {
-            if (sharedstate.shift) {
-              // Get monitor info
-              WINDOWPLACEMENT wndpl = { sizeof(WINDOWPLACEMENT) };
-              GetWindowPlacement(hwnd, &wndpl);
-              HMONITOR monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-              MONITORINFO mi = { sizeof(MONITORINFO) };
-              GetMonitorInfo(monitor, &mi);
-              RECT mon = mi.rcWork;
-              RECT fmon = mi.rcMonitor;
-              // Toggle maximized state
-              wndpl.showCmd = (wndpl.showCmd==SW_MAXIMIZE)?SW_RESTORE:SW_MAXIMIZE;
-              // If maximizing, also center window on monitor, if needed
-              if (wndpl.showCmd == SW_MAXIMIZE) {
-                HMONITOR wndmonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-                if (monitor != wndmonitor) {
-                  int width = wndpl.rcNormalPosition.right-wndpl.rcNormalPosition.left;
-                  int height = wndpl.rcNormalPosition.bottom-wndpl.rcNormalPosition.top;
-                  wndpl.rcNormalPosition.left = fmon.left+(mon.right-mon.left)/2-width/2;
-                  wndpl.rcNormalPosition.top = fmon.top+(mon.bottom-mon.top)/2-height/2;
-                  wndpl.rcNormalPosition.right = wndpl.rcNormalPosition.left+width;
-                  wndpl.rcNormalPosition.bottom = wndpl.rcNormalPosition.top+height;
-                }
-              }
-              SetWindowPlacement(hwnd, &wndpl);
-            }
-            else {
-              SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOACTIVATE|SWP_NOMOVE|SWP_NOSIZE);
-            }
-          }
-          else {
-            if (sharedstate.shift) {
-              SendMessage(hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
-            }
-            else {
-              SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOACTIVATE|SWP_NOMOVE|SWP_NOSIZE);
-            }
-          }
-        }
+*/
+__declspec(dllexport) LRESULT CALLBACK LowLevelMouseProc( int nCode, WPARAM wParam, LPARAM lParam )
+{
+		DWORD		tMsNow_u32 = GetTickCount();
+	if ( nCode == HC_ACTION )
+	{
+		// Set up some variables
+		PMSLLHOOKSTRUCT		msg = (PMSLLHOOKSTRUCT)lParam;
+		int		button =
+				(wParam==WM_LBUTTONDOWN||wParam==WM_LBUTTONUP)?BUTTON_LMB:
+				(wParam==WM_MBUTTONDOWN||wParam==WM_MBUTTONUP)?BUTTON_MMB:
+				(wParam==WM_RBUTTONDOWN||wParam==WM_RBUTTONUP)?BUTTON_RMB:
+				(HIWORD(msg->mouseData)==XBUTTON1)?BUTTON_MB4:
+				(HIWORD(msg->mouseData)==XBUTTON2)?BUTTON_MB5:BUTTON_NONE;
 
-        // Block original scroll event
-        state.blockaltup = 1;
-        state.activated = 1;
-        return 1;
-      }
-      else if (!state.alt && !sharedstate.action && sharedsettings.InactiveScroll) {
-        // Get window and foreground window
-        HWND hwnd = WindowFromPoint(pt);
-        HWND foreground = GetForegroundWindow();
+		enum {STATE_NONE, STATE_DOWN, STATE_UP}		buttonstate =
+				(wParam==WM_LBUTTONDOWN||wParam==WM_MBUTTONDOWN||wParam==WM_RBUTTONDOWN||wParam==WM_XBUTTONDOWN)?STATE_DOWN:
+				(wParam==WM_LBUTTONUP||wParam==WM_MBUTTONUP||wParam==WM_RBUTTONUP||wParam==WM_XBUTTONUP)?STATE_UP:STATE_NONE;
+		int		action = GetAction( button );
 
-        // Return if no window or if foreground window is blacklisted
-        if (hwnd == NULL || (foreground != NULL && blacklisted(foreground,&settings.Blacklist))) {
-          return CallNextHookEx(NULL, nCode, wParam, lParam);
-        }
 
-        // Get class
-        wchar_t classname[20] = L"";
-        GetClassName(hwnd, classname, ARRAY_SIZE(classname));
 
-        // Hide if tooltip
-        if (!wcscmp(classname,TOOLTIPS_CLASS)) {
-          ShowWindow(hwnd, SW_HIDE);
-          hwnd = WindowFromPoint(pt);
-          if (hwnd == NULL) {
-            return CallNextHookEx(NULL, nCode, wParam, lParam);
-          }
-          GetClassName(hwnd, classname, ARRAY_SIZE(classname));
-        }
 
-        // If it's a groupbox, grab the real window
-        LONG_PTR style = GetWindowLongPtr(hwnd, GWL_STYLE);
-        if ((style&BS_GROUPBOX) && !wcscmp(classname,L"Button")) {
-          HWND groupbox = hwnd;
-          EnableWindow(groupbox, FALSE);
-          hwnd = WindowFromPoint(pt);
-          EnableWindow(groupbox, TRUE);
-          if (hwnd == NULL) {
-            return CallNextHookEx(NULL, nCode, wParam, lParam);
-          }
-        }
 
-        // Get wheel info
-        WPARAM wp = GET_WHEEL_DELTA_WPARAM(msg->mouseData) << 16;
-        LPARAM lp = (pt.y << 16) | (pt.x & 0xFFFF);
 
-        // Change WM_MOUSEWHEEL to WM_MOUSEHWHEEL if shift is being depressed
-        // Note that this does not work on all windows, the message was introduced in Vista and far from all programs have implemented it
-        if (wParam == WM_MOUSEWHEEL && sharedstate.shift && (GetAsyncKeyState(VK_SHIFT)&0x8000)) {
-          wParam = WM_MOUSEHWHEEL;
-          wp = (-GET_WHEEL_DELTA_WPARAM(msg->mouseData)) << 16; // Up is left, down is right
-        }
 
-        // Add button information since we don't get it with the hook
-        if (GetAsyncKeyState(VK_CONTROL)&0x8000)  wp |= MK_CONTROL;
-        if (GetAsyncKeyState(VK_LBUTTON)&0x8000)  wp |= MK_LBUTTON;
-        if (GetAsyncKeyState(VK_MBUTTON)&0x8000)  wp |= MK_MBUTTON;
-        if (GetAsyncKeyState(VK_RBUTTON)&0x8000)  wp |= MK_RBUTTON;
-        if (GetAsyncKeyState(VK_SHIFT)&0x8000)    wp |= MK_SHIFT;
-        if (GetAsyncKeyState(VK_XBUTTON1)&0x8000) wp |= MK_XBUTTON1;
-        if (GetAsyncKeyState(VK_XBUTTON2)&0x8000) wp |= MK_XBUTTON2;
+		POINT		pt = msg->pt;
+		POINT		posBgn_P;
+		if ( state.scrollThroughMouseMove_b )
+		{
+			posBgn_P = state.scrollThroughMousePos_P;
+		}
+		else
+		{
+			posBgn_P = pt;
+		}
+#if ( HOOKS_DBG_SCROLL )
+	{	/* Log Meldung ausgeben. */
+		FILE *f = OpenLog( L"ab" );
+		fwprintf( f, L"%u: hwnd von posBgn_P %i %i bestimmen.\n", tMsNow_u32, posBgn_P.x, posBgn_P.y );
+		CloseLog( f );
+	}
+#endif
+#if 1
+		HWND		hwnd;
+		{	// Get window and foreground window
+			hwnd = WindowFromPoint( posBgn_P );
+			HWND		foreground = GetForegroundWindow();
 
-        // Forward scroll message
-        SendMessage(hwnd, wParam, wp, lp);
+			// Return if no window or if foreground window is blacklisted
+			if (   ( hwnd == NULL ) || (  ( foreground != NULL ) && blacklisted( foreground, &settings.Blacklist )  )   )
+			{
+	#if ( HOOKS_DBG_SCROLL )
+		{
+			FILE *f = OpenLog( L"ab" );
+			fwprintf( f, L"%u: return because blacklisted. \n", tMsNow_u32 );
+			CloseLog( f );
+		}
+	#endif
+				return CallNextHookEx(NULL, nCode, wParam, lParam);
+			}
 
-        // Block original scroll event
-        return 1;
-      }
-    }
+			// Get class
+			wchar_t		classname[20] = L"";
+			GetClassName(  hwnd, classname, ARRAY_SIZE( classname )  );
 
-    // Lower window if middle mouse button is used on the title bar
-    // A twist from other programs is that this applies to the top border and corners and the buttons as well, which may be useful if the window has a small title bar (or none), e.g. web browsers with a lot of tabs open
-    if (sharedsettings.LowerWithMMB && !state.alt && !sharedstate.action && buttonstate == STATE_DOWN && button == BUTTON_MMB) {
-      HWND hwnd = WindowFromPoint(pt);
-      if (hwnd == NULL) {
-        return CallNextHookEx(NULL, nCode, wParam, lParam);
-      }
-      hwnd = GetAncestor(hwnd, GA_ROOT);
-      int area = SendMessage(hwnd, WM_NCHITTEST, 0, MAKELPARAM(pt.x,pt.y));
-      if (area == HTCAPTION || area == HTTOP || area == HTTOPLEFT || area == HTTOPRIGHT || area == HTSYSMENU || area == HTMINBUTTON || area == HTMAXBUTTON || area == HTCLOSE) {
-        if (sharedstate.shift) {
-          SendMessage(hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
-        }
-        else {
-          SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOACTIVATE|SWP_NOMOVE|SWP_NOSIZE);
-        }
-        return 1;
-      }
-    }
+			// Hide if tooltip
+			if (  ! wcscmp( classname, TOOLTIPS_CLASS )  )
+			{
+				ShowWindow( hwnd, SW_HIDE );
+	#if ( HOOKS_DBG_SCROLL )
+		{
+			FILE *f = OpenLog( L"ab" );
+			fwprintf( f, L"%u: ShowWindow( hwnd, SW_HIDE ).\n", tMsNow_u32 );
+			CloseLog( f );
+		}
+	#endif
+				hwnd = WindowFromPoint( posBgn_P );
+				if ( hwnd == NULL )
+				{
+	#if ( HOOKS_DBG_SCROLL )
+		{
+			FILE *f = OpenLog( L"ab" );
+			fwprintf( f, L"%u: return tooltip.\n", tMsNow_u32 );
+			CloseLog( f );
+		}
+	#endif
+					return CallNextHookEx( NULL, nCode, wParam, lParam );
+				}
+				GetClassName(  hwnd, classname, ARRAY_SIZE( classname )  );
+			}
 
-    // Return if no mouse action will be started
-    if (!action) {
-      return CallNextHookEx(NULL, nCode, wParam, lParam);
-    }
+	#if 0
+	wenn eingeschaltet gehen manche File Dialoge nicht mehr zu klicken!
+			// If it's a groupbox, grab the real window
+			LONG_PTR		style = GetWindowLongPtr(hwnd, GWL_STYLE);
+			if (   ( style & BS_GROUPBOX ) && (  ! wcscmp( classname,L"Button" )  )   )
+			{
+		#if ( HOOKS_DBG_SCROLL )
+			{
+				FILE *f = OpenLog( L"ab" );
+				fwprintf( f, L"%u: groupbox.\n", tMsNow_u32 );
+				CloseLog( f );
+			}
+		#endif
+				HWND		groupbox = hwnd;
+				EnableWindow( groupbox, FALSE );
+				hwnd = WindowFromPoint( posBgn_P );
+				EnableWindow( groupbox, TRUE );
+				if ( hwnd == NULL )
+				{
+		#if ( HOOKS_DBG_SCROLL )
+			{
+				FILE *f = OpenLog( L"ab" );
+				fwprintf( f, L"%u: return groupbox.\n", tMsNow_u32 );
+				CloseLog( f );
+			}
+		#endif
+					return CallNextHookEx( NULL, nCode, wParam, lParam );
+				}
+			}
+	#endif
+		}
+		/* hwnd hat einen Wert. */
+	#if ( HOOKS_DBG_SCROLL )
+		{
+			FILE *f = OpenLog( L"ab" );
+			fwprintf( f, L"%u: hwnd hat einen Wert. \n", tMsNow_u32 );
+			CloseLog( f );
+		}
+	#endif
 
-    // Get monitor info
-    HMONITOR monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO mi = { sizeof(MONITORINFO) };
-    GetMonitorInfo(monitor, &mi);
-    RECT mon = mi.rcWork;
-    RECT fmon = mi.rcMonitor;
 
-    // Toggle maximized state if move+resize is clicked
-    if (buttonstate == STATE_DOWN && sharedstate.action == ACTION_MOVE && action == ACTION_RESIZE) {
-      KillTimer(g_hwnd, RESTORE_TIMER);
-      // Toggle maximized state
-      WINDOWPLACEMENT wndpl = { sizeof(WINDOWPLACEMENT) };
-      GetWindowPlacement(state.hwnd, &wndpl);
-      wndpl.showCmd = (wndpl.showCmd==SW_MAXIMIZE)?SW_RESTORE:SW_MAXIMIZE;
-      state.locked = (wndpl.showCmd==SW_MAXIMIZE);
-      state.origin.maximized = (wndpl.showCmd==SW_MAXIMIZE);
-      // If maximizing, also center window on monitor, if needed
-      if (wndpl.showCmd == SW_MAXIMIZE) {
-        HMONITOR wndmonitor = MonitorFromWindow(state.hwnd, MONITOR_DEFAULTTONEAREST);
-        if (monitor != wndmonitor) {
-          wndpl.rcNormalPosition.left = fmon.left+(mon.right-mon.left)/2-state.origin.width/2;
-          wndpl.rcNormalPosition.top = fmon.top+(mon.bottom-mon.top)/2-state.origin.height/2;
-          wndpl.rcNormalPosition.right = wndpl.rcNormalPosition.left+state.origin.width;
-          wndpl.rcNormalPosition.bottom = wndpl.rcNormalPosition.top+state.origin.height;
-        }
-        state.origin.monitor = monitor;
-      }
-      else {
-        // Otherwise, reset offset
-        state.offset.x = (float)(pt.x-fmon.left)/(fmon.right-fmon.left)*state.origin.width;
-        state.offset.y = (float)(pt.y-fmon.top)/(fmon.bottom-fmon.top)*state.origin.height;
-      }
-      SetWindowPlacement(state.hwnd, &wndpl);
-      MouseMove();
-      return 1;
-    }
+		if ( 0 )
+		{
+		}
+		else if ( button == BUTTON_MMB )
+		{	/* Scrollen ueber Maus Taste und Maus Bewegung. */
+			switch ( buttonstate )
+			{
+				case STATE_DOWN:
+				{	/* Einschalten des Scrollens ueber Maus. */
 
-    // Block mousedown if we are busy with another action
-    if (sharedstate.action && buttonstate == STATE_DOWN) {
-      return 1; // Block mousedown so AltDrag.exe does not remove cursorwnd
-    }
+		#if 0
+		Dies funktioniert nicht, vermutlich werden die Meldungen uebers Verstellen von den meisten Programmen nicht ausgewertet.
+		UINT		ulScrollLines = 1;
+		SystemParametersInfo( SPI_SETWHEELSCROLLLINES, ulScrollLines, 0, 0 );
+		#endif
 
-    if (state.alt && buttonstate == STATE_DOWN) {
-      RECT wnd;
+#if ( HOOKS_DBG_SCROLL )
+					{
+						FILE *f = OpenLog( L"ab" );
+						fwprintf( f, L"%u: Einschalten des Scrollens ueber Maus\n", tMsNow_u32 );
+						CloseLog( f );
+					}
+#endif
+					state.scrollThroughMouseMove_b = true;
+					state.scrollThroughMouseTmsDown_u32 = tMsNow_u32 /* ms */;
+					state.scrollThroughMousePos_P = pt; /*< Aktuelle Mouse Position speichern. */
 
-      // Double check if any of the hotkeys are being pressed
-      int i;
-      if (!state.activated) { // Don't check if we've activated, because keyups would be blocked and GetAsyncKeyState() won't return the correct state
-        for (i=0; i < sharedsettings.Hotkeys.length; i++) {
-          if (GetAsyncKeyState(sharedsettings.Hotkeys.keys[i])&0x8000) {
-            break;
-          }
-          else if (i+1 == sharedsettings.Hotkeys.length) {
-            state.alt = 0;
-            UnhookMouse();
-            Error(L"No hotkeys down", L"LowLevelMouseProc()", 0);
-            return CallNextHookEx(NULL, nCode, wParam, lParam);
-          }
-        }
-      }
+					return 1;	/* Meldung nicht weitergeben. */
+					break;
+				}
+				case STATE_UP:
+				{	/* Beenden des Scrollen ueber Maus.
 
-      // Okay, at least one trigger key is being pressed
-      HCURSOR cursor = NULL;
+					Vorwaerts/zurueck wird mit dieser Nachricht verarbeitet.
+					*/
+					state.scrollThroughMouseMove_b = false;
+					DWORD		dtMs_u32 = tMsNow_u32 /* ms */ - state.scrollThroughMouseTmsDown_u32;
+#if ( HOOKS_DBG_SCROLL )
+					{	/* Log Meldung ausgeben. */
+						FILE *f = OpenLog( L"ab" );
+						fwprintf( f, L"%u: Beenden des Scrollens ueber Maus nach %ums\n", tMsNow_u32, dtMs_u32 );
+						CloseLog( f );
+					}
+#endif
+		#if 0
+			UINT		ulScrollLines = 3;
+			SystemParametersInfo( SPI_SETWHEELSCROLLLINES, ulScrollLines, 0, 0 );
+		#endif
+					if ( dtMs_u32 > 200 /* ms */ )
+					{
+						return 1;	/* Meldung nicht weitergeben. */
+					}
+					else if ( button == BUTTON_MMB )
+					{	/* Mittlere Maus Taste schicken. */
+#if ( HOOKS_DBG_SCROLL )
+						{	/* Log Meldung ausgeben. */
+							FILE *f = OpenLog( L"ab" );
+							fwprintf( f, L"%u: Mittlere Maus Taste down aus up.\n", tMsNow_u32 );
+							CloseLog( f );
+						}
+#endif
+						if ( hwnd != 0 )
+						{	/* STATE_DOWN ans Fenster schicken bei dem man ist. */
 
-      // Make sure cursorwnd isn't in the way
-      if (sharedsettings.Performance.Cursor) {
-        ShowWindow(cursorwnd, SW_HIDE);
-      }
 
-      // Get window
-      state.mdiclient = NULL;
-      state.hwnd = WindowFromPoint(pt);
-      if (state.hwnd == NULL) {
-        return CallNextHookEx(NULL, nCode, wParam, lParam);
-      }
-      // Hide if tooltip
-      wchar_t classname[20] = L"";
-      GetClassName(state.hwnd, classname, ARRAY_SIZE(classname));
-      if (!wcscmp(classname,TOOLTIPS_CLASS)) {
-        ShowWindow(state.hwnd, SW_HIDE);
-        state.hwnd = WindowFromPoint(pt);
-        if (state.hwnd == NULL) {
-          return CallNextHookEx(NULL, nCode, wParam, lParam);
-        }
-      }
-      // MDI or not
-      HWND root = GetAncestor(state.hwnd, GA_ROOT);
-      POINT mdiclientpt = {0,0};
-      if (sharedsettings.MDI) {
-        while (state.hwnd != root) {
-          HWND parent = GetParent(state.hwnd);
-          LONG_PTR exstyle = GetWindowLongPtr(state.hwnd, GWL_EXSTYLE);
-          if ((exstyle&WS_EX_MDICHILD)) {
-            // Found MDI child, parent is now MDIClient window
-            state.mdiclient = parent;
-            if (GetClientRect(state.mdiclient,&fmon) == 0
-             || ClientToScreen(state.mdiclient,&mdiclientpt) == FALSE) {
-              return CallNextHookEx(NULL, nCode, wParam, lParam);
-            }
-            mon = fmon;
-            break;
-          }
-          state.hwnd = parent;
-        }
-      }
-      else {
-        state.hwnd = root;
-      }
+							/*
+								The low-order word specifies the x-coordinate of the cursor. The coordinate is relative to the upper-left corner of the client area.
 
-      LONG_PTR style = GetWindowLongPtr(state.hwnd, GWL_STYLE);
-      WINDOWPLACEMENT wndpl = { sizeof(WINDOWPLACEMENT) };
+								The high-order word specifies the y-coordinate of the cursor. The coordinate is relative to the upper-left corner of the client area.
+							*/
+							POINT		clientCoor_P = posBgn_P;
+							if (  ! ScreenToClient( hwnd, &clientCoor_P )  )
+							{
+								Error( L"LowLevelMouseProc()", L"GetWindowRect()", GetLastError() );
+							}
+							LPARAM 		lp = MAKELPARAM( clientCoor_P.x, clientCoor_P.y );
+#if ( HOOKS_DBG_SCROLL )
+							{	/* Log Meldung ausgeben. */
+								FILE *f = OpenLog( L"ab" );
+								fwprintf( f, L"%u: Koordinate posBgn_P %i %i, client %i %i.\n", tMsNow_u32, posBgn_P.x, posBgn_P.y, clientCoor_P.x, clientCoor_P.y );
+								CloseLog( f );
+							}
+#endif
 
-      // Use this to print info about the window which is about to be dragged
-      /*{
-        wchar_t title[100], classname[100];
-        GetWindowText(state.hwnd, title, ARRAY_SIZE(title));
-        GetClassName(state.hwnd, classname, ARRAY_SIZE(classname));
-        GetWindowRect(state.hwnd, &wnd);
-        FILE *f = OpenLog(L"wb");
-        fwprintf(f, L"hwnd     : 0x%08x\nTitle    : %s\nClassname: %s\nSize     : %dx%d\nPosition : %dx%d\nStyle    : 0x%08X\nWS_THICKFRAME: %d\n", state.hwnd, title, classname, wnd.right-wnd.left, wnd.bottom-wnd.top, wnd.left, wnd.top, style, !!(style&WS_THICKFRAME));
-        fwprintf(f, L"Is fullscreen? %d == %d && %d == %d && %d == %d && %d == %d: %d\n\n", wnd.left, fmon.left, wnd.top, fmon.top, wnd.right, fmon.right, wnd.bottom, fmon.bottom, wnd.left==fmon.left && wnd.top==fmon.top && wnd.right==fmon.right && wnd.bottom==fmon.bottom);
-        CloseLog(f);
-      }*/
+							UINT		msg_ui = WM_MBUTTONDOWN;
+							WPARAM		wp = MAKEWPARAM( 0, wParam | MK_MBUTTON );
+							SendMessage( hwnd, msg_ui, wp, lp );
+						}
+					}
+					break;
+				}
+				default:
+				{
+#if ( HOOKS_DBG_SCROLL )
+					FILE *f = OpenLog( L"ab" );
+					fwprintf( f, L"%u: Fehler bei Maustaste Code!\n", tMsNow_u32 );
+					CloseLog( f );
+#endif
+					break;
+				}
+			}
+		}
+		else if (  ( state.scrollThroughMouseMove_b ) && ( wParam == WM_MOUSEMOVE )  )
+		{
+			#if 0
+			{	/* Log Meldung ausgeben. */
+				FILE *f = OpenLog( L"ab" );
+				fwprintf( f, L"Verschieben ueber die Maus .\n" );
+				CloseLog( f );
+			}
+			#endif
 
-      // Return if window is blacklisted, if we can't get information about it, or if the window is fullscreen
-      if (blacklisted(state.hwnd,&settings.ProcessBlacklist)
-       || blacklisted(state.hwnd,&settings.Blacklist)
-       || GetWindowPlacement(state.hwnd,&wndpl) == 0
-       || GetWindowRect(state.hwnd,&wnd) == 0
-       || ((style&WS_CAPTION) != WS_CAPTION && wnd.left == fmon.left && wnd.top == fmon.top && wnd.right == fmon.right && wnd.bottom == fmon.bottom)) {
-        return CallNextHookEx(NULL, nCode, wParam, lParam);
-      }
+			#if 0
+			Funktioniert nicht, da nicht alle Fenster die eine Scrollbar haben auf diese Anfrage reagieren:
+				SCROLLINFO		scrollinfo_o;
+				scrollinfo_o.cbSize = sizeof( SCROLLINFO );
+				scrollinfo_o.fMask = SIF_POS | SIF_RANGE;
+				scrollinfo_o.nMin = 0;
+				scrollinfo_o.nMax = 0;
+				scrollinfo_o.nPos = 0;
+				BOOL		scrollInfoRet_b = GetScrollInfo( hwnd, SB_VERT, &scrollinfo_o );
+				if ( ! scrollInfoRet_b )
+				{
+					Error( L"LowLevelMouseProc()", L"GetScrollInfo()", GetLastError() );
+				}
 
-      // Update state
-      sharedstate.action = action;
-      if (!sharedstate.snap) {
-        sharedstate.snap = sharedsettings.AutoSnap;
-      }
-      state.activated = 1;
-      state.blockaltup = 1;
-      state.locked = 0;
-      state.origin.maximized = IsZoomed(state.hwnd);
-      state.origin.width = wndpl.rcNormalPosition.right-wndpl.rcNormalPosition.left;
-      state.origin.height = wndpl.rcNormalPosition.bottom-wndpl.rcNormalPosition.top;
-      state.origin.monitor = MonitorFromWindow(state.hwnd, MONITOR_DEFAULTTONEAREST);
+#if ( HOOKS_DBG_SCROLL )
+				{	/* Log Meldung ausgeben. */
+					FILE *f = OpenLog( L"ab" );
+					fwprintf( f, L"ScrollInfo nMin=%i, nMax=%i, nPos=%i, ret=%i.\n", scrollinfo_o.nMin, scrollinfo_o.nMax, scrollinfo_o.nPos, scrollInfoRet_b );
+					CloseLog( f );
+				}
+#endif
+				//SetScrollInfo
+			#endif
 
-      // Check if window is in the wnddb database
-      state.wndentry = NULL;
-      for (i=0; i < NUMWNDDB; i++) {
-        if (wnddb.items[i].hwnd == state.hwnd) {
-          state.wndentry = &wnddb.items[i];
-          break;
-        }
-      }
+			// Forward scroll message
+			POINT		posNow_P = msg->pt;
+			LONG		dx_i32 = posNow_P.x - posBgn_P.x;
+			LONG		dy_i32 = posNow_P.y - posBgn_P.y;
 
-      // Find a nice place in wnddb if not already present
-      if (state.wndentry == NULL) {
-        for (i=0; i < NUMWNDDB+1 && wnddb.pos->restore == 1; i++) {
-          wnddb.pos = (wnddb.pos == &wnddb.items[NUMWNDDB-1])?&wnddb.items[0]:wnddb.pos+1;
-        }
-        state.wndentry = wnddb.pos;
-        state.wndentry->hwnd = state.hwnd;
-        state.wndentry->restore = 0;
-      }
+		DWORD		tMs_u32 = GetTickCount();
+		DWORD		tMsX_u32 = state.scrollThroughMouseDeltaCurXupdtTms_u32 - tMs_u32;
+		LONG		dxCur_i32 = state.scrollThroughMouseDeltaCurX_i32;
+		if ( tMsX_u32 > scrollThroughMouseDeltaResetTms_u32 )
+		{	/* Die letzte Veraenderung von scrollThroughMouseDeltaCurX_i32 ist zu lange her -  restwert nullen. */
+			dxCur_i32 = 0;
+		}
 
-      // AutoFocus
-      if (sharedsettings.AutoFocus) {
-        SetForegroundWindow(state.hwnd);
-      }
+#if ( HOOKS_DBG_SCROLL )
+			{	/* Log Meldung ausgeben. */
+				FILE*		f = OpenLog( L"ab" );
+				fwprintf( f, L"Aktuelle (relative) Mouse Pos x=%i, y=%i ( dx=%i, dy=%i ).\n", posNow_P.x, posNow_P.y, dx_i32, dy_i32 );
+				CloseLog( f );
+			}
+#endif
 
-      // Get minmaxinfo
-      if (action == ACTION_MOVE || action == ACTION_RESIZE) {
-        MINMAXINFO mmi = {{160,28}, {GetSystemMetrics(SM_CXMAXIMIZED),GetSystemMetrics(SM_CYMAXIMIZED)}, {mon.left-8,mon.top-8}, {GetSystemMetrics(SM_CXMINTRACK),GetSystemMetrics(SM_CYMINTRACK)}, {GetSystemMetrics(SM_CXMAXTRACK),GetSystemMetrics(SM_CXMAXTRACK)}};
-        SendMessage(state.hwnd, WM_GETMINMAXINFO, 0, (LPARAM)&mmi);
-        state.mmi.ptMinTrackSize = mmi.ptMinTrackSize;
-        state.mmi.ptMaxTrackSize = mmi.ptMaxTrackSize;
-      }
+			LPARAM 		lp = MAKELPARAM( posBgn_P.x, posBgn_P.y );
+			if ( dx_i32 != 0 )
+			{
+				LONG		dxNew_i32 = dxCur_i32 + dx_i32;
+				LONG		dxNewAbs_i32 = dxNew_i32;
+				bool		neg_b = false;
+				if ( dxNewAbs_i32 < 0 )
+				{
+					dxNewAbs_i32 = -dxNewAbs_i32;
+					neg_b = true;
+				}
+				LONG		movement_i32 = 0;
+				while ( dxNewAbs_i32 > scrollThroughMouseDeltaOneInc_u )
+				{
+					dxNewAbs_i32 -= scrollThroughMouseDeltaOneInc_u;
+					movement_i32++;
+				}
+				LONG		deltaCurX_i32 = dxNewAbs_i32;
+				if ( neg_b )
+				{
+					movement_i32 = -movement_i32;
+					deltaCurX_i32 = -deltaCurX_i32;
+				}
 
-      // Do things depending on what button was pressed
-      if (action == ACTION_MOVE) {
-        // Maximize window if this is a double-click
-        if (GetTickCount()-state.clicktime <= GetDoubleClickTime()) {
-          sharedstate.action = ACTION_NONE; // Stop move action
-          state.clicktime = 0; // Reset double-click time
-          state.blockmouseup = 1; // Block the mouseup, otherwise it can trigger a context menu (e.g. in explorer, or on the desktop)
+				state.scrollThroughMouseDeltaCurX_i32 = deltaCurX_i32;
+				state.scrollThroughMouseDeltaCurXupdtTms_u32 = tMs_u32;
 
-          // Center window on monitor, if needed
-          HMONITOR wndmonitor = MonitorFromWindow(state.hwnd, MONITOR_DEFAULTTONEAREST);
-          if (monitor != wndmonitor) {
-            wndpl.rcNormalPosition.left = fmon.left+(mon.right-mon.left)/2-state.origin.width/2;
-            wndpl.rcNormalPosition.top = fmon.top+(mon.bottom-mon.top)/2-state.origin.height/2;
-            wndpl.rcNormalPosition.right = wndpl.rcNormalPosition.left+state.origin.width;
-            wndpl.rcNormalPosition.bottom = wndpl.rcNormalPosition.top+state.origin.height;
-          }
-          wndpl.showCmd = SW_MAXIMIZE;
-          SetWindowPlacement(state.hwnd, &wndpl);
+				if ( movement_i32 != 0 )
+				{
+					#if 0
+					{	/* Log Meldung ausgeben. */
+						FILE*		f = OpenLog( L"ab" );
+						fwprintf( f, L"Movement dx_i32=%i, movement_i32=%i, dxCur_i32=%i, deltaCurX_i32=%i.\n", dx_i32, movement_i32, dxCur_i32, deltaCurX_i32 );
+						CloseLog( f );
+					}
+					#endif
 
-          // Prevent mousedown from propagating
-          return 1;
-        }
+					UINT		msg_ui = WM_MOUSEHWHEEL;
+					WPARAM		wp = MAKEWPARAM( 0, WHEEL_DELTA * movement_i32 );
+					SendMessage( hwnd, msg_ui, wp, lp );
+				}
+			}
 
-        // Restore old width/height?
-        int restore = 0;
-        if (state.wndentry->restore
-         && state.wndentry->last.width == state.origin.width
-         && state.wndentry->last.height == state.origin.height) {
-          restore = 1;
-          state.origin.width = state.wndentry->width;
-          state.origin.height = state.wndentry->height;
-        }
-        state.wndentry->restore = 0;
+			DWORD		tMsY_u32 = state.scrollThroughMouseDeltaCurYupdtTms_u32 - tMs_u32;
+			LONG		dyCur_i32 = state.scrollThroughMouseDeltaCurY_i32;
+			if ( tMsY_u32 > scrollThroughMouseDeltaResetTms_u32 )
+			{	/* Die letzte Veraenderung von scrollThroughMouseDeltaCurY_i32 ist zu lange her -  restwert nullen. */
+				dyCur_i32 = 0;
+			}
+			if ( dy_i32 != 0 )
+			{
+				LONG		dyNew_i32 = dyCur_i32 + dy_i32;
+				LONG		dyNewAbs_i32 = dyNew_i32;
+				bool		neg_b = false;
+				if ( dyNewAbs_i32 < 0 )
+				{
+					dyNewAbs_i32 = -dyNewAbs_i32;
+					neg_b = true;
+				}
+				LONG		movement_i32 = 0;
+				while ( dyNewAbs_i32 > scrollThroughMouseDeltaOneInc_u )
+				{
+					dyNewAbs_i32 -= scrollThroughMouseDeltaOneInc_u;
+					movement_i32++;
+				}
+				LONG		deltaCurY_i32 = dyNewAbs_i32;
+				if ( neg_b )
+				{
+					movement_i32 = -movement_i32;
+					deltaCurY_i32 = -deltaCurY_i32;
+				}
 
-        // Set offset
-        if (state.origin.maximized) {
-          state.offset.x = (float)(pt.x-wnd.left)/(wnd.right-wnd.left)*state.origin.width;
-          state.offset.y = (float)(pt.y-wnd.top)/(wnd.bottom-wnd.top)*state.origin.height;
+				state.scrollThroughMouseDeltaCurY_i32 = deltaCurY_i32;
+				state.scrollThroughMouseDeltaCurYupdtTms_u32 = tMs_u32;
 
-          // Restore the window
-          wndpl.showCmd = SW_RESTORE;
-          SetWindowPlacement(state.hwnd, &wndpl);
+				if ( movement_i32 != 0 )
+				{
+#if ( HOOKS_DBG_SCROLL )
+					{	/* Log Meldung ausgeben. */
+						FILE*		f = OpenLog( L"ab" );
+						fwprintf( f, L"Movement dy_i32=%i, movement_i32=%i, dyCur_i32=%i, deltaCurY_i32=%i.\n", dy_i32, movement_i32, dyCur_i32, deltaCurY_i32 );
+						CloseLog( f );
+					}
+#endif
+					UINT		msg_ui = WM_MOUSEWHEEL;
+					WPARAM		wp = MAKEWPARAM( 0, WHEEL_DELTA * (-movement_i32) );
+					SendMessage( hwnd, msg_ui, wp, lp );
+				}
+			}
 
-          // Set new position
-          MouseMove();
-        }
-        else if (restore) {
-          state.offset.x = (float)(pt.x-wnd.left)/(wnd.right-wnd.left)*state.origin.width;
-          state.offset.y = (float)(pt.y-wnd.top)/(wnd.bottom-wnd.top)*state.origin.height;
-          MoveWindow(state.hwnd, pt.x-state.offset.x-mdiclientpt.x, pt.y-state.offset.y-mdiclientpt.y, state.origin.width, state.origin.height, TRUE);
-        }
-        else {
-          state.offset.x = pt.x-wnd.left;
-          state.offset.y = pt.y-wnd.top;
-        }
+			return 1;
+		#if 0
+			SystemParametersInfo(SPI_GETWHEELSCROLLLINES, 0, pulScrollLines, 0)	/*< Determining the Number of Scroll Lines. */
+			// SPI_SETWHEELSCROLLLINES
+		#endif
+		}
+		else if ( wParam == WM_MOUSEMOVE )
+		{	// Handle mouse move and scroll
 
-        cursor = cursors[HAND];
-      }
-      else if (action == ACTION_RESIZE) {
-        // Restore the window (to monitor size) if it's maximized
-        if (state.origin.maximized) {
-          wndpl.rcNormalPosition = fmon; // Set size to full monitor to prevent flickering
-          wnd = mon;
-          if (state.mdiclient) {
-            // Make it a little smaller since MDIClients by default have scrollbars that would otherwise appear
-            wndpl.rcNormalPosition.right -= 10;
-            wndpl.rcNormalPosition.bottom -= 10;
-          }
-          wndpl.showCmd = SW_RESTORE;
-          SetWindowPlacement(state.hwnd, &wndpl);
-          if (state.mdiclient) {
-            // Get new values from MDIClient, since restoring the child have changed them, and the amount they change with differ depending on implementation (compare mIRC and Spy++)
-            Sleep(1); // Sometimes needed
-            mdiclientpt = (POINT) {0,0};
-            if (GetClientRect(state.mdiclient,&wnd) == 0
-             || ClientToScreen(state.mdiclient,&mdiclientpt) == FALSE) {
-              return CallNextHookEx(NULL, nCode, wParam, lParam);
-            }
-          }
-          // Update origin width/height
-          state.origin.width = wnd.right-wnd.left;
-          state.origin.height = wnd.bottom-wnd.top;
-          // Move window
-          MoveWindow(state.hwnd, wnd.left, wnd.top, state.origin.width, state.origin.height, TRUE);
-          wnd = (RECT) { wnd.left+mdiclientpt.x, wnd.top+mdiclientpt.y, wnd.right+mdiclientpt.x, wnd.bottom+mdiclientpt.y };
-        }
+			// Store prevpt so we can check if the hook goes stale
+			state.prevpt = pt;
+			// Move the window
+			if ( sharedstate.action == ACTION_MOVE || sharedstate.action == ACTION_RESIZE )
+			{
+			state.updaterate = (state.updaterate+1)%(sharedstate.action==ACTION_MOVE?sharedsettings.Performance.MoveRate:sharedsettings.Performance.ResizeRate);
+			if (state.updaterate == 0)
+			{
+				if ( sharedsettings.Performance.Cursor )
+				{
+					MoveWindow(cursorwnd, pt.x-20, pt.y-20, 41, 41, TRUE);
+					//MoveWindow(cursorwnd,(prevpt.x<pt.x?prevpt.x:pt.x)-3,(prevpt.y<pt.y?prevpt.y:pt.y)-3,(pt.x>prevpt.x?pt.x-prevpt.x:prevpt.x-pt.x)+7,(pt.y>prevpt.y?pt.y-prevpt.y:prevpt.y-pt.y)+7,FALSE);
+					}
+					MouseMove();
+				}
+			}
 
-        // Set edge and offset
-        // Think of the window as nine boxes (corner regions get 38%, middle only 24%)
-        // Does not use state.origin.width/height since that is based on wndpl.rcNormalPosition which is not what you see when resizing a window that Windows Aero resized
-        int wndwidth = wnd.right-wnd.left;
-        int wndheight = wnd.bottom-wnd.top;
-        if (pt.x-wnd.left < wndwidth*(38/100.0)) {
-          state.resize.x = RESIZE_LEFT;
-          state.offset.x = pt.x-wnd.left;
-        }
-        else if (pt.x-wnd.left < wndwidth*(62/100.0)) {
-          state.resize.x = RESIZE_CENTER;
-          state.offset.x = pt.x-mdiclientpt.x; // Used only if both x and y are CENTER
-        }
-        else {
-          state.resize.x = RESIZE_RIGHT;
-          state.offset.x = wnd.right-pt.x;
-        }
-        if (pt.y-wnd.top < wndheight*(38/100.0)) {
-          state.resize.y = RESIZE_TOP;
-          state.offset.y = pt.y-wnd.top;
-        }
-        else if (pt.y-wnd.top < wndheight*(62/100.0)) {
-          state.resize.y = RESIZE_CENTER;
-          state.offset.y = pt.y-mdiclientpt.y;
-        }
-        else {
-          state.resize.y = RESIZE_BOTTOM;
-          state.offset.y = wnd.bottom-pt.y;
-        }
+			// Reset double-click time
+			// Unfortunately, we have to remember the previous pointer position since WM_MOUSEMOVE is sometimes sent even
+			// if the mouse hasn't moved, e.g. when running Windows virtualized or when connecting to a remote desktop.
+			if (  ( pt.x != state.clickpt.x ) || ( pt.y != state.clickpt.y )  )
+			{
+				state.clicktime = 0;
+			}
+		}
+		else if (  ( wParam == WM_MOUSEWHEEL ) || ( wParam == WM_MOUSEHWHEEL )  )
+		{	/* horizontal or vertical wheel. */
+			if (  state.alt && ( ! sharedstate.action ) && sharedsettings.Mouse.Scroll && ( ! state.interrupted )  )
+			{	/*
+					state.alt > 0: hook ist registriert
+					( ! sharedstate.action ): Bearbeitung ist hier nicht gestartet
+					sharedsettings.Mouse.Scroll != ACTION_NONE
+					state.interrupted > 0: dies wurde nicht durch einen Tastureingabe unterbrochen.
+				*/
+				int		delta = GET_WHEEL_DELTA_WPARAM( msg->mouseData );
+				if ( sharedsettings.Mouse.Scroll == ACTION_ALTTAB )
+				{
+					numhwnds = 0;
+					if ( sharedsettings.MDI )
+					{	/* Muesste das sein, dass bei MDI die einzelnen MDI Fenster auch bei der  Taskwechsel Anzeige dabei sind. */
+						HWND		hwnd = WindowFromPoint( pt );
+						// Hide if tooltip
+						wchar_t		classname[20] = L"";
+						GetClassName(  hwnd, classname, ARRAY_SIZE( classname )  );
+						if (  ! wcscmp( classname, TOOLTIPS_CLASS )  )
+						{
+							ShowWindow( hwnd, SW_HIDE );
+							hwnd = WindowFromPoint(pt);
+						}
+						if ( hwnd != NULL )
+						{
+							// Get MDIClient
+							HWND mdiclient = NULL;
+							char classname[100] = "";
+							GetClassNameA(  hwnd, classname, ARRAY_SIZE( classname )  );
+							if (  ! strcmp( classname, "MDIClient" )  )
+							{
+								mdiclient = hwnd;
+							}
+							else
+							{
+								while (hwnd != NULL)
+								{
+									HWND parent = GetParent(hwnd);
+									LONG_PTR exstyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+									if ((exstyle&WS_EX_MDICHILD))
+									{
+										mdiclient = parent;
+										break;
+									}
+									hwnd = parent;
+								}
+							}
+							// Enumerate and then reorder MDI windows
+							if ( mdiclient != NULL )
+							{
+								hwnd = GetWindow(mdiclient, GW_CHILD);
+								while ( hwnd != NULL )
+								{
+									if (numhwnds == hwnds_alloc)
+									{
+										hwnds_alloc += 20;
+										hwnds = realloc(hwnds, hwnds_alloc*sizeof(HWND));
+									}
+									hwnds[numhwnds++] = hwnd;
+									hwnd = GetWindow(hwnd, GW_HWNDNEXT);
+								}
+								if ( numhwnds > 1 )
+								{
+									if (delta > 0)
+									{
+										SendMessage( mdiclient, WM_MDIACTIVATE, (WPARAM) hwnds[numhwnds-1], 0 );
+									}
+									else
+									{
+										SetWindowPos( hwnds[0], hwnds[numhwnds-1], 0, 0, 0, 0, SWP_NOACTIVATE|SWP_NOMOVE|SWP_NOSIZE );
+										SendMessage( mdiclient, WM_MDIACTIVATE, (WPARAM) hwnds[1], 0 );
+									}
+								}
+							}
+						}
+					}
 
-        // Set window right/bottom origin
-        state.origin.right = wnd.right-mdiclientpt.x;
-        state.origin.bottom = wnd.bottom-mdiclientpt.y;
+					// Enumerate windows
+					if (numhwnds <= 1)
+					{
+						state.origin.monitor = MonitorFromPoint( pt, MONITOR_DEFAULTTONEAREST );
+						numhwnds = 0;
+						EnumWindows( EnumAltTabWindows, 0 );
+						if ( numhwnds <= 1 )
+						{
+							return CallNextHookEx( NULL, nCode, wParam, lParam );
+						}
+						// Reorder windows
+						if ( delta > 0 )
+						{
+							SetForegroundWindow(hwnds[numhwnds-1]);
+						}
+						else
+						{
+							SetWindowPos( hwnds[0], hwnds[numhwnds-1], 0, 0, 0, 0, SWP_NOACTIVATE|SWP_NOMOVE|SWP_NOSIZE );
+							SetForegroundWindow( hwnds[1] );
+						}
+					}
 
-        // Aero-move this window if this is a double-click
-        if (GetTickCount()-state.clicktime <= GetDoubleClickTime()) {
-          sharedstate.action = ACTION_NONE; // Stop resize action
-          state.clicktime = 0; // Reset double-click time
-          state.blockmouseup = 1; // Block the mouseup, otherwise it can trigger a context menu (e.g. in explorer, or on the desktop)
+					// Use this to print the windows
+					/*
+					FILE *f = OpenLog(L"ab");
+					fwprintf(f, L"numhwnds: %d\n", numhwnds);
+					wchar_t title[100], classname[100];
+					int k;
+					for (k=0; k < numhwnds; k++) {
+					GetWindowText(hwnds[k], title, ARRAY_SIZE(title));
+					GetClassName(hwnds[k], classname, ARRAY_SIZE(classname));
+					RECT wnd;
+					GetWindowRect(hwnds[k], &wnd);
+					fwprintf(f, L"wnd #%03d (0x%08x): %s [%s] (%dx%d @ %dx%d)\n", k, hwnds[k], title, classname, wnd.right-wnd.left, wnd.bottom-wnd.top, wnd.left, wnd.top);
+					}
+				fwprintf(f, L"\n");
+				CloseLog(f);
+				*/
+				}
+				else if ( sharedsettings.Mouse.Scroll == ACTION_VOLUME )
+				{
+					IMMDeviceEnumerator *pDevEnumerator = NULL;
+					IMMDevice *pDev = NULL;
+					IAudioEndpointVolume *pAudioEndpoint = NULL;
 
-          // Get and set new position
-          int posx, posy, wndwidth, wndheight;
-          wndwidth = max(min((mon.right-mon.left)/2, state.mmi.ptMaxTrackSize.x), state.mmi.ptMinTrackSize.x);
-          wndheight = max(min((mon.bottom-mon.top)/2, state.mmi.ptMaxTrackSize.y), state.mmi.ptMinTrackSize.y);
-          posx = mon.left;
-          posy = mon.top;
-          if (state.resize.y == RESIZE_CENTER) {
-            wndheight = max(min((mon.bottom-mon.top), state.mmi.ptMaxTrackSize.y), state.mmi.ptMinTrackSize.y);
-            posy += (mon.bottom-mon.top)/2-wndheight/2;
-          }
-          else if (state.resize.y == RESIZE_BOTTOM) {
-            posy = mon.bottom-wndheight;
-          }
-          if (state.resize.x == RESIZE_CENTER && state.resize.y != RESIZE_CENTER) {
-            wndwidth = max(min((mon.right-mon.left), state.mmi.ptMaxTrackSize.x), state.mmi.ptMinTrackSize.x);
-            posx += (mon.right-mon.left)/2-wndwidth/2;
-          }
-          else if (state.resize.x == RESIZE_CENTER) {
-            wndwidth = wnd.right-wnd.left;
-            posx = wnd.left-mdiclientpt.x;
-          }
-          else if (state.resize.x == RESIZE_RIGHT) {
-            posx = mon.right-wndwidth;
-          }
-          MoveWindow(state.hwnd, posx, posy, wndwidth, wndheight, TRUE);
+					// Get audio endpoint
+					HRESULT hr = CoCreateInstance(&my_CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, &my_IID_IMMDeviceEnumerator, (void**)&pDevEnumerator);
+					if (hr != S_OK) {
+					Error(L"CoCreateInstance(MMDeviceEnumerator)", L"LowLevelMouseProc()", hr);
+					return CallNextHookEx(NULL, nCode, wParam, lParam);
+					}
+					hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(pDevEnumerator, eRender, eMultimedia, &pDev);
+					IMMDeviceEnumerator_Release(pDevEnumerator);
+					if (hr != S_OK) {
+					Error(L"IMMDeviceEnumerator_GetDefaultAudioEndpoint(eRender, eMultimedia)", L"LowLevelMouseProc()", hr);
+					return CallNextHookEx(NULL, nCode, wParam, lParam);
+					}
+					hr = IMMDevice_Activate(pDev, &my_IID_IAudioEndpointVolume, CLSCTX_ALL, NULL, (void**)&pAudioEndpoint);
+					IMMDevice_Release(pDev);
+					if (hr != S_OK) {
+					Error(L"IMMDevice_Activate(IID_IAudioEndpointVolume)", L"LowLevelMouseProc()", hr);
+					return CallNextHookEx(NULL, nCode, wParam, lParam);
+					}
 
-          // Get new size after move
-          // Doing this since wndwidth and wndheight might be wrong if the window is resized in chunks (e.g. PuTTY)
-          GetWindowRect(state.hwnd, &wnd);
-          // Update wndentry
-          state.wndentry->last.width = wnd.right-wnd.left;
-          state.wndentry->last.height = wnd.bottom-wnd.top;
-          if (!state.wndentry->restore) {
-            state.wndentry->width = state.origin.width;
-            state.wndentry->height = state.origin.height;
-            state.wndentry->restore = 1;
-          }
+					// Function pointer so we only need one for-loop
+					typedef HRESULT WINAPI (*_VolumeStep)(IAudioEndpointVolume*, LPCGUID pguidEventContext);
+					_VolumeStep VolumeStep = (_VolumeStep)(pAudioEndpoint->lpVtbl->VolumeStepDown);
+					if (delta > 0) {
+					VolumeStep = (_VolumeStep)(pAudioEndpoint->lpVtbl->VolumeStepUp);
+					}
 
-          // Prevent mousedown from propagating
-          return 1;
-        }
+					// Hold shift to make 5 steps
+					int i;
+					int num = (sharedstate.shift)?5:1;
+					for (i=0; i < num; i++) {
+					hr = VolumeStep(pAudioEndpoint, NULL);
+					}
+					IAudioEndpointVolume_Release(pAudioEndpoint);
+					if (hr != S_OK) {
+					Error(L"IAudioEndpointVolume_VolumeStepUp/Down()", L"LowLevelMouseProc()", hr);
+					return CallNextHookEx(NULL, nCode, wParam, lParam);
+					}
+				}
+				else if (sharedsettings.Mouse.Scroll == ACTION_TRANSPARENCY)
+				{
+					HWND hwnd = WindowFromPoint(pt);
+					if ( hwnd == NULL )
+					{
+						return CallNextHookEx(NULL, nCode, wParam, lParam);
+					}
+					hwnd = GetAncestor(hwnd, GA_ROOT);
 
-        // Set cursor
-        if (sharedsettings.Performance.Cursor) {
-          if ((state.resize.y == RESIZE_TOP && state.resize.x == RESIZE_LEFT)
-           || (state.resize.y == RESIZE_BOTTOM && state.resize.x == RESIZE_RIGHT)) {
-            cursor = cursors[SIZENWSE];
-          }
-          else if ((state.resize.y == RESIZE_TOP && state.resize.x == RESIZE_RIGHT)
-           || (state.resize.y == RESIZE_BOTTOM && state.resize.x == RESIZE_LEFT)) {
-            cursor = cursors[SIZENESW];
-          }
-          else if ((state.resize.y == RESIZE_TOP && state.resize.x == RESIZE_CENTER)
-           || (state.resize.y == RESIZE_BOTTOM && state.resize.x == RESIZE_CENTER)) {
-            cursor = cursors[SIZENS];
-          }
-          else if ((state.resize.y == RESIZE_CENTER && state.resize.x == RESIZE_LEFT)
-           || (state.resize.y == RESIZE_CENTER && state.resize.x == RESIZE_RIGHT)) {
-            cursor = cursors[SIZEWE];
-          }
-          else {
-            cursor = cursors[SIZEALL];
-          }
-        }
-      }
-      else if (action == ACTION_MINIMIZE) {
-        SendMessage(state.hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
-      }
-      else if (action == ACTION_CENTER) {
-        MoveWindow(state.hwnd, mon.left+(mon.right-mon.left)/2-state.origin.width/2, mon.top+(mon.bottom-mon.top)/2-state.origin.height/2, state.origin.width, state.origin.height, TRUE);
-      }
-      else if (action == ACTION_ALWAYSONTOP) {
-        LONG_PTR topmost = GetWindowLongPtr(state.hwnd,GWL_EXSTYLE)&WS_EX_TOPMOST;
-        SetWindowPos(state.hwnd, (topmost?HWND_NOTOPMOST:HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE);
-      }
-      else if (action == ACTION_CLOSE) {
-        SendMessage(state.hwnd, WM_CLOSE, 0, 0);
-      }
-      else if (action == ACTION_LOWER) {
-        if (sharedstate.shift) {
-          SendMessage(state.hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
-        }
-        else {
-          SetWindowPos(state.hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOACTIVATE|SWP_NOMOVE|SWP_NOSIZE);
-        }
-      }
+					LONG_PTR exstyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+					if (!(exstyle&WS_EX_LAYERED)) {
+					SetWindowLongPtr(hwnd, GWL_EXSTYLE, exstyle|WS_EX_LAYERED);
+					SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+					}
 
-      // Send WM_ENTERSIZEMOVE and prepare update timer
-      if (action == ACTION_MOVE || action == ACTION_RESIZE) {
-        // Don't send WM_ENTERSIZEMOVE if the window is iTunes
-        wchar_t classname[30] = L"";
-        GetClassName(state.hwnd, classname, ARRAY_SIZE(classname));
-        if (wcscmp(classname,L"iTunes")) {
-          SendMessage(state.hwnd, WM_ENTERSIZEMOVE, 0, 0);
-        }
-        // Prepare update timer
-        state.updaterate = 0;
-        if ((action == ACTION_MOVE   && sharedsettings.Performance.MoveRate > 1)
-         || (action == ACTION_RESIZE && sharedsettings.Performance.ResizeRate > 1)) {
-          SetTimer(g_hwnd, MOVE_TIMER, 100, NULL);
-        }
-      }
+					BYTE old_alpha;
+					DWORD flags;
+					if (GetLayeredWindowAttributes(hwnd,NULL,&old_alpha,&flags) == FALSE) {
+					Error(L"GetLayeredWindowAttributes()", L"LowLevelMouseProc()", GetLastError());
+					return CallNextHookEx(NULL, nCode, wParam, lParam);
+					}
+					int alpha = old_alpha;
 
-      // We have to send the ctrl keys here too because of IE (and maybe some other program?)
-      state.ignorectrl = 1;
-      KEYBDINPUT ctrl[2] = {{VK_CONTROL,0,0,0}, {VK_CONTROL,0,KEYEVENTF_KEYUP,0}};
-      ctrl[0].dwExtraInfo = ctrl[1].dwExtraInfo = GetMessageExtraInfo();
-      INPUT input[2] = {{INPUT_KEYBOARD,{.ki=ctrl[0]}}, {INPUT_KEYBOARD,{.ki=ctrl[1]}}};
-      SendInput(2, input, sizeof(INPUT));
-      state.ignorectrl = 0;
+					int alpha_delta = (sharedstate.shift)?8:64;
+					if (delta > 0) {
+					alpha += alpha_delta;
+					if (alpha > 255) {
+					alpha = 255;
+					}
+					}
+					else {
+					alpha -= alpha_delta;
+					if (alpha < 8) {
+					alpha = 8;
+					}
+					}
+					SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
+				}
+				else if (sharedsettings.Mouse.Scroll == ACTION_LOWER)
+				{
+					HWND hwnd = WindowFromPoint(pt);
+					if (hwnd == NULL) {
+					return CallNextHookEx(NULL, nCode, wParam, lParam);
+					}
+					hwnd = GetAncestor(hwnd, GA_ROOT);
 
-      // Remember time of this click so we can check for double-click
-      state.clicktime = GetTickCount();
-      state.clickpt = pt;
+					if (delta > 0) {
+					if (sharedstate.shift) {
+					// Get monitor info
+					WINDOWPLACEMENT wndpl = { sizeof(WINDOWPLACEMENT) };
+					GetWindowPlacement(hwnd, &wndpl);
+					HMONITOR monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+					MONITORINFO mi = { sizeof(MONITORINFO) };
+					GetMonitorInfo(monitor, &mi);
+					RECT mon = mi.rcWork;
+					RECT fmon = mi.rcMonitor;
+					// Toggle maximized state
+					wndpl.showCmd = (wndpl.showCmd==SW_MAXIMIZE)?SW_RESTORE:SW_MAXIMIZE;
+					// If maximizing, also center window on monitor, if needed
+					if (wndpl.showCmd == SW_MAXIMIZE) {
+					HMONITOR wndmonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+					if (monitor != wndmonitor) {
+					int width = wndpl.rcNormalPosition.right-wndpl.rcNormalPosition.left;
+					int height = wndpl.rcNormalPosition.bottom-wndpl.rcNormalPosition.top;
+					wndpl.rcNormalPosition.left = fmon.left+(mon.right-mon.left)/2-width/2;
+					wndpl.rcNormalPosition.top = fmon.top+(mon.bottom-mon.top)/2-height/2;
+					wndpl.rcNormalPosition.right = wndpl.rcNormalPosition.left+width;
+					wndpl.rcNormalPosition.bottom = wndpl.rcNormalPosition.top+height;
+					}
+					}
+					SetWindowPlacement(hwnd, &wndpl);
+					}
+					else {
+					SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOACTIVATE|SWP_NOMOVE|SWP_NOSIZE);
+					}
+					}
+					else {
+					if (sharedstate.shift) {
+					SendMessage(hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+					}
+					else {
+					SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOACTIVATE|SWP_NOMOVE|SWP_NOSIZE);
+					}
+					}
+				}
 
-      // Update cursor
-      if (sharedsettings.Performance.Cursor && cursor != NULL) {
-        MoveWindow(cursorwnd, pt.x-20, pt.y-20, 41, 41, FALSE);
-        SetClassLongPtr(cursorwnd, GCLP_HCURSOR, (LONG_PTR)cursor);
-        ShowWindowAsync(cursorwnd, SW_SHOWNA);
-      }
+				// Block original scroll event
+				state.blockaltup = 1;
+				state.activated = 1;
+				return 1;
+			}
+			else if (  ( ! state.alt ) && ( ! sharedstate.action ) && sharedsettings.InactiveScroll  )
+			{
+				// Get window and foreground window
+				HWND hwnd = WindowFromPoint(pt);
+				HWND foreground = GetForegroundWindow();
 
-      // Prevent mousedown from propagating
-      return 1;
-    }
-    else if (buttonstate == STATE_UP && state.blockmouseup) {
-      state.blockmouseup = 0;
-      return 1;
-    }
-    else if (buttonstate == STATE_UP && sharedstate.action == action) {
-      sharedstate.action = ACTION_NONE;
+				// Return if no window or if foreground window is blacklisted
+				if (hwnd == NULL || (foreground != NULL && blacklisted(foreground,&settings.Blacklist)))
+				{
+					return CallNextHookEx(NULL, nCode, wParam, lParam);
+				}
 
-      // Send WM_EXITSIZEMOVE
-      if (action == ACTION_MOVE || action == ACTION_RESIZE) {
-        // Don't send WM_EXITSIZEMOVE if the window is iTunes
-        wchar_t classname[30] = L"";
-        GetClassName(state.hwnd, classname, ARRAY_SIZE(classname));
-        if (wcscmp(classname,L"iTunes")) {
-          SendMessage(state.hwnd, WM_EXITSIZEMOVE, 0, 0);
-        }
-      }
+				// Get class
+				wchar_t classname[20] = L"";
+				GetClassName(hwnd, classname, ARRAY_SIZE(classname));
 
-      // Unhook mouse?
-      if (!state.alt) {
-        UnhookMouse();
-      }
+				// Hide if tooltip
+				if (!wcscmp(classname,TOOLTIPS_CLASS))
+				{
+					ShowWindow(hwnd, SW_HIDE);
+					hwnd = WindowFromPoint(pt);
+					if (hwnd == NULL)
+					{
+						return CallNextHookEx(NULL, nCode, wParam, lParam);
+					}
+					GetClassName(hwnd, classname, ARRAY_SIZE(classname));
+				}
 
-      // Hide cursorwnd
-      if (sharedsettings.Performance.Cursor) {
-        ShowWindowAsync(cursorwnd, SW_HIDE);
-      }
+				// If it's a groupbox, grab the real window
+				LONG_PTR		style = GetWindowLongPtr(hwnd, GWL_STYLE);
+				if ((style & BS_GROUPBOX) && !wcscmp(classname,L"Button"))
+				{
+					HWND groupbox = hwnd;
+					EnableWindow(groupbox, FALSE);
+					hwnd = WindowFromPoint(pt);
+					EnableWindow(groupbox, TRUE);
+					if (hwnd == NULL)
+					{
+						return CallNextHookEx(NULL, nCode, wParam, lParam);
+					}
+				}
 
-      // Prevent mouseup from propagating
-      return 1;
-    }
-  }
+				// Get wheel info
+				WPARAM wp = GET_WHEEL_DELTA_WPARAM(msg->mouseData) << 16;
+				LPARAM lp = (pt.y << 16) | (pt.x & 0xFFFF);
 
-  return CallNextHookEx(NULL, nCode, wParam, lParam);
+				// Change WM_MOUSEWHEEL to WM_MOUSEHWHEEL if shift is being depressed
+				// Note that this does not work on all windows, the message was introduced in Vista and far from all programs have implemented it
+				if (wParam == WM_MOUSEWHEEL && sharedstate.shift && (GetAsyncKeyState(VK_SHIFT)&0x8000))
+				{
+					wParam = WM_MOUSEHWHEEL;
+					wp = (-GET_WHEEL_DELTA_WPARAM(msg->mouseData)) << 16; // Up is left, down is right
+				}
+
+				// Add button information since we don't get it with the hook
+				if (GetAsyncKeyState(VK_CONTROL)&0x8000)  wp |= MK_CONTROL;
+				if (GetAsyncKeyState(VK_LBUTTON)&0x8000)  wp |= MK_LBUTTON;
+				if (GetAsyncKeyState(VK_MBUTTON)&0x8000)  wp |= MK_MBUTTON;
+				if (GetAsyncKeyState(VK_RBUTTON)&0x8000)  wp |= MK_RBUTTON;
+				if (GetAsyncKeyState(VK_SHIFT)&0x8000)    wp |= MK_SHIFT;
+				if (GetAsyncKeyState(VK_XBUTTON1)&0x8000) wp |= MK_XBUTTON1;
+				if (GetAsyncKeyState(VK_XBUTTON2)&0x8000) wp |= MK_XBUTTON2;
+
+				// Forward scroll message
+				SendMessage(hwnd, wParam, wp, lp);
+
+				// Block original scroll event
+				return 1;
+			}
+		}
+
+		// Lower window if middle mouse button is used on the title bar
+		// A twist from other programs is that this applies to the top border and corners and the buttons as well, which may be useful if the window has a small title bar (or none), e.g. web browsers with a lot of tabs open
+		if (  sharedsettings.LowerWithMMB && !state.alt && !sharedstate.action && buttonstate == STATE_DOWN && button == BUTTON_MMB  )
+		{
+			HWND hwnd = WindowFromPoint(pt);
+			if (hwnd == NULL) {
+			return CallNextHookEx(NULL, nCode, wParam, lParam);
+			}
+			hwnd = GetAncestor(hwnd, GA_ROOT);
+			int area = SendMessage(hwnd, WM_NCHITTEST, 0, MAKELPARAM(pt.x,pt.y));
+			if (area == HTCAPTION || area == HTTOP || area == HTTOPLEFT || area == HTTOPRIGHT || area == HTSYSMENU || area == HTMINBUTTON || area == HTMAXBUTTON || area == HTCLOSE) {
+			if (sharedstate.shift) {
+			SendMessage(hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+			}
+			else {
+			SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOACTIVATE|SWP_NOMOVE|SWP_NOSIZE);
+			}
+			return 1;
+			}
+		}
+
+		// Return if no mouse action will be started
+		if ( ! action )
+		{
+			return CallNextHookEx(NULL, nCode, wParam, lParam);
+		}
+
+		// Get monitor info
+		HMONITOR monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+		MONITORINFO mi = { sizeof(MONITORINFO) };
+		GetMonitorInfo(monitor, &mi);
+		RECT mon = mi.rcWork;
+		RECT fmon = mi.rcMonitor;
+
+		// Toggle maximized state if move+resize is clicked
+		if (buttonstate == STATE_DOWN && sharedstate.action == ACTION_MOVE && action == ACTION_RESIZE) {
+		KillTimer(g_hwnd, RESTORE_TIMER);
+		// Toggle maximized state
+		WINDOWPLACEMENT wndpl = { sizeof(WINDOWPLACEMENT) };
+		GetWindowPlacement(state.hwnd, &wndpl);
+		wndpl.showCmd = (wndpl.showCmd==SW_MAXIMIZE)?SW_RESTORE:SW_MAXIMIZE;
+		state.locked = (wndpl.showCmd==SW_MAXIMIZE);
+		state.origin.maximized = (wndpl.showCmd==SW_MAXIMIZE);
+		// If maximizing, also center window on monitor, if needed
+		if (wndpl.showCmd == SW_MAXIMIZE) {
+		HMONITOR wndmonitor = MonitorFromWindow(state.hwnd, MONITOR_DEFAULTTONEAREST);
+		if (monitor != wndmonitor) {
+		wndpl.rcNormalPosition.left = fmon.left+(mon.right-mon.left)/2-state.origin.width/2;
+		wndpl.rcNormalPosition.top = fmon.top+(mon.bottom-mon.top)/2-state.origin.height/2;
+		wndpl.rcNormalPosition.right = wndpl.rcNormalPosition.left+state.origin.width;
+		wndpl.rcNormalPosition.bottom = wndpl.rcNormalPosition.top+state.origin.height;
+		}
+		state.origin.monitor = monitor;
+		}
+		else {
+		// Otherwise, reset offset
+		state.offset.x = (float)(pt.x-fmon.left)/(fmon.right-fmon.left)*state.origin.width;
+		state.offset.y = (float)(pt.y-fmon.top)/(fmon.bottom-fmon.top)*state.origin.height;
+		}
+		SetWindowPlacement(state.hwnd, &wndpl);
+		MouseMove();
+		return 1;
+		}
+
+		// Block mousedown if we are busy with another action
+		if (sharedstate.action && buttonstate == STATE_DOWN) {
+		return 1; // Block mousedown so AltDrag.exe does not remove cursorwnd
+		}
+
+		if (state.alt && buttonstate == STATE_DOWN) {
+		RECT wnd;
+
+		// Double check if any of the hotkeys are being pressed
+		int i;
+		if (!state.activated) { // Don't check if we've activated, because keyups would be blocked and GetAsyncKeyState() won't return the correct state
+		for (i=0; i < sharedsettings.Hotkeys.length; i++) {
+		if (GetAsyncKeyState(sharedsettings.Hotkeys.keys[i])&0x8000) {
+		break;
+		}
+		else if (i+1 == sharedsettings.Hotkeys.length) {
+		state.alt = 0;
+		UnhookMouse();
+		Error(L"No hotkeys down", L"LowLevelMouseProc()", 0);
+		return CallNextHookEx(NULL, nCode, wParam, lParam);
+		}
+		}
+		}
+
+		// Okay, at least one trigger key is being pressed
+		HCURSOR cursor = NULL;
+
+		// Make sure cursorwnd isn't in the way
+		if (sharedsettings.Performance.Cursor) {
+		ShowWindow(cursorwnd, SW_HIDE);
+		}
+
+		// Get window
+		state.mdiclient = NULL;
+		state.hwnd = WindowFromPoint(pt);
+		if (state.hwnd == NULL) {
+		return CallNextHookEx(NULL, nCode, wParam, lParam);
+		}
+		// Hide if tooltip
+		wchar_t classname[20] = L"";
+		GetClassName(state.hwnd, classname, ARRAY_SIZE(classname));
+		if (!wcscmp(classname,TOOLTIPS_CLASS)) {
+		ShowWindow(state.hwnd, SW_HIDE);
+		state.hwnd = WindowFromPoint(pt);
+		if (state.hwnd == NULL) {
+		return CallNextHookEx(NULL, nCode, wParam, lParam);
+		}
+		}
+		// MDI or not
+		HWND root = GetAncestor(state.hwnd, GA_ROOT);
+		POINT mdiclientpt = {0,0};
+		if (sharedsettings.MDI) {
+		while (state.hwnd != root) {
+		HWND parent = GetParent(state.hwnd);
+		LONG_PTR exstyle = GetWindowLongPtr(state.hwnd, GWL_EXSTYLE);
+		if ((exstyle&WS_EX_MDICHILD)) {
+		// Found MDI child, parent is now MDIClient window
+		state.mdiclient = parent;
+		if (GetClientRect(state.mdiclient,&fmon) == 0
+		|| ClientToScreen(state.mdiclient,&mdiclientpt) == FALSE) {
+		return CallNextHookEx(NULL, nCode, wParam, lParam);
+		}
+		mon = fmon;
+		break;
+		}
+		state.hwnd = parent;
+		}
+		}
+		else {
+		state.hwnd = root;
+		}
+
+		LONG_PTR style = GetWindowLongPtr(state.hwnd, GWL_STYLE);
+		WINDOWPLACEMENT wndpl = { sizeof(WINDOWPLACEMENT) };
+
+		// Use this to print info about the window which is about to be dragged
+		/*{
+		wchar_t title[100], classname[100];
+		GetWindowText(state.hwnd, title, ARRAY_SIZE(title));
+		GetClassName(state.hwnd, classname, ARRAY_SIZE(classname));
+		GetWindowRect(state.hwnd, &wnd);
+		FILE *f = OpenLog(L"wb");
+		fwprintf(f, L"hwnd     : 0x%08x\nTitle    : %s\nClassname: %s\nSize     : %dx%d\nPosition : %dx%d\nStyle    : 0x%08X\nWS_THICKFRAME: %d\n", state.hwnd, title, classname, wnd.right-wnd.left, wnd.bottom-wnd.top, wnd.left, wnd.top, style, !!(style&WS_THICKFRAME));
+		fwprintf(f, L"Is fullscreen? %d == %d && %d == %d && %d == %d && %d == %d: %d\n\n", wnd.left, fmon.left, wnd.top, fmon.top, wnd.right, fmon.right, wnd.bottom, fmon.bottom, wnd.left==fmon.left && wnd.top==fmon.top && wnd.right==fmon.right && wnd.bottom==fmon.bottom);
+		CloseLog(f);
+		}*/
+
+		// Return if window is blacklisted, if we can't get information about it, or if the window is fullscreen
+		if (blacklisted(state.hwnd,&settings.ProcessBlacklist)
+		|| blacklisted(state.hwnd,&settings.Blacklist)
+		|| GetWindowPlacement(state.hwnd,&wndpl) == 0
+		|| GetWindowRect(state.hwnd,&wnd) == 0
+		|| ((style&WS_CAPTION) != WS_CAPTION && wnd.left == fmon.left && wnd.top == fmon.top && wnd.right == fmon.right && wnd.bottom == fmon.bottom)) {
+		return CallNextHookEx(NULL, nCode, wParam, lParam);
+		}
+
+		// Update state
+		sharedstate.action = action;
+		if (!sharedstate.snap) {
+		sharedstate.snap = sharedsettings.AutoSnap;
+		}
+		state.activated = 1;
+		state.blockaltup = 1;
+		state.locked = 0;
+		state.origin.maximized = IsZoomed(state.hwnd);
+		state.origin.width = wndpl.rcNormalPosition.right-wndpl.rcNormalPosition.left;
+		state.origin.height = wndpl.rcNormalPosition.bottom-wndpl.rcNormalPosition.top;
+		state.origin.monitor = MonitorFromWindow(state.hwnd, MONITOR_DEFAULTTONEAREST);
+
+		// Check if window is in the wnddb database
+		state.wndentry = NULL;
+		for (i=0; i < NUMWNDDB; i++) {
+		if (wnddb.items[i].hwnd == state.hwnd) {
+		state.wndentry = &wnddb.items[i];
+		break;
+		}
+		}
+
+		// Find a nice place in wnddb if not already present
+		if (state.wndentry == NULL) {
+		for (i=0; i < NUMWNDDB+1 && wnddb.pos->restore == 1; i++) {
+		wnddb.pos = (wnddb.pos == &wnddb.items[NUMWNDDB-1])?&wnddb.items[0]:wnddb.pos+1;
+		}
+		state.wndentry = wnddb.pos;
+		state.wndentry->hwnd = state.hwnd;
+		state.wndentry->restore = 0;
+		}
+
+		// AutoFocus
+		if (sharedsettings.AutoFocus) {
+		SetForegroundWindow(state.hwnd);
+		}
+
+		// Get minmaxinfo
+		if (action == ACTION_MOVE || action == ACTION_RESIZE) {
+		MINMAXINFO mmi = {{160,28}, {GetSystemMetrics(SM_CXMAXIMIZED),GetSystemMetrics(SM_CYMAXIMIZED)}, {mon.left-8,mon.top-8}, {GetSystemMetrics(SM_CXMINTRACK),GetSystemMetrics(SM_CYMINTRACK)}, {GetSystemMetrics(SM_CXMAXTRACK),GetSystemMetrics(SM_CXMAXTRACK)}};
+		SendMessage(state.hwnd, WM_GETMINMAXINFO, 0, (LPARAM)&mmi);
+		state.mmi.ptMinTrackSize = mmi.ptMinTrackSize;
+		state.mmi.ptMaxTrackSize = mmi.ptMaxTrackSize;
+		}
+
+		// Do things depending on what button was pressed
+		if (action == ACTION_MOVE) {
+		// Maximize window if this is a double-click
+		if (GetTickCount()-state.clicktime <= GetDoubleClickTime()) {
+		sharedstate.action = ACTION_NONE; // Stop move action
+		state.clicktime = 0; // Reset double-click time
+		state.blockmouseup = 1; // Block the mouseup, otherwise it can trigger a context menu (e.g. in explorer, or on the desktop)
+
+		// Center window on monitor, if needed
+		HMONITOR wndmonitor = MonitorFromWindow(state.hwnd, MONITOR_DEFAULTTONEAREST);
+		if (monitor != wndmonitor) {
+		wndpl.rcNormalPosition.left = fmon.left+(mon.right-mon.left)/2-state.origin.width/2;
+		wndpl.rcNormalPosition.top = fmon.top+(mon.bottom-mon.top)/2-state.origin.height/2;
+		wndpl.rcNormalPosition.right = wndpl.rcNormalPosition.left+state.origin.width;
+		wndpl.rcNormalPosition.bottom = wndpl.rcNormalPosition.top+state.origin.height;
+		}
+		wndpl.showCmd = SW_MAXIMIZE;
+		SetWindowPlacement(state.hwnd, &wndpl);
+
+		// Prevent mousedown from propagating
+		return 1;
+		}
+
+		// Restore old width/height?
+		int restore = 0;
+		if (state.wndentry->restore
+		&& state.wndentry->last.width == state.origin.width
+		&& state.wndentry->last.height == state.origin.height) {
+		restore = 1;
+		state.origin.width = state.wndentry->width;
+		state.origin.height = state.wndentry->height;
+		}
+		state.wndentry->restore = 0;
+
+		// Set offset
+		if (state.origin.maximized) {
+		state.offset.x = (float)(pt.x-wnd.left)/(wnd.right-wnd.left)*state.origin.width;
+		state.offset.y = (float)(pt.y-wnd.top)/(wnd.bottom-wnd.top)*state.origin.height;
+
+		// Restore the window
+		wndpl.showCmd = SW_RESTORE;
+		SetWindowPlacement(state.hwnd, &wndpl);
+
+		// Set new position
+		MouseMove();
+		}
+		else if (restore) {
+		state.offset.x = (float)(pt.x-wnd.left)/(wnd.right-wnd.left)*state.origin.width;
+		state.offset.y = (float)(pt.y-wnd.top)/(wnd.bottom-wnd.top)*state.origin.height;
+		MoveWindow(state.hwnd, pt.x-state.offset.x-mdiclientpt.x, pt.y-state.offset.y-mdiclientpt.y, state.origin.width, state.origin.height, TRUE);
+		}
+		else {
+		state.offset.x = pt.x-wnd.left;
+		state.offset.y = pt.y-wnd.top;
+		}
+
+		cursor = cursors[HAND];
+		}
+		else if (action == ACTION_RESIZE) {
+		// Restore the window (to monitor size) if it's maximized
+		if (state.origin.maximized) {
+		wndpl.rcNormalPosition = fmon; // Set size to full monitor to prevent flickering
+		wnd = mon;
+		if (state.mdiclient) {
+		// Make it a little smaller since MDIClients by default have scrollbars that would otherwise appear
+		wndpl.rcNormalPosition.right -= 10;
+		wndpl.rcNormalPosition.bottom -= 10;
+		}
+		wndpl.showCmd = SW_RESTORE;
+		SetWindowPlacement(state.hwnd, &wndpl);
+		if (state.mdiclient) {
+		// Get new values from MDIClient, since restoring the child have changed them, and the amount they change with differ depending on implementation (compare mIRC and Spy++)
+		Sleep(1); // Sometimes needed
+		mdiclientpt = (POINT) {0,0};
+		if (GetClientRect(state.mdiclient,&wnd) == 0
+		|| ClientToScreen(state.mdiclient,&mdiclientpt) == FALSE) {
+		return CallNextHookEx(NULL, nCode, wParam, lParam);
+		}
+		}
+		// Update origin width/height
+		state.origin.width = wnd.right-wnd.left;
+		state.origin.height = wnd.bottom-wnd.top;
+		// Move window
+		MoveWindow(state.hwnd, wnd.left, wnd.top, state.origin.width, state.origin.height, TRUE);
+		wnd = (RECT) { wnd.left+mdiclientpt.x, wnd.top+mdiclientpt.y, wnd.right+mdiclientpt.x, wnd.bottom+mdiclientpt.y };
+		}
+
+		// Set edge and offset
+		// Think of the window as nine boxes (corner regions get 38%, middle only 24%)
+		// Does not use state.origin.width/height since that is based on wndpl.rcNormalPosition which is not what you see when resizing a window that Windows Aero resized
+		int wndwidth = wnd.right-wnd.left;
+		int wndheight = wnd.bottom-wnd.top;
+		if (pt.x-wnd.left < wndwidth*(38/100.0)) {
+		state.resize.x = RESIZE_LEFT;
+		state.offset.x = pt.x-wnd.left;
+		}
+		else if (pt.x-wnd.left < wndwidth*(62/100.0)) {
+		state.resize.x = RESIZE_CENTER;
+		state.offset.x = pt.x-mdiclientpt.x; // Used only if both x and y are CENTER
+		}
+		else {
+		state.resize.x = RESIZE_RIGHT;
+		state.offset.x = wnd.right-pt.x;
+		}
+		if (pt.y-wnd.top < wndheight*(38/100.0)) {
+		state.resize.y = RESIZE_TOP;
+		state.offset.y = pt.y-wnd.top;
+		}
+		else if (pt.y-wnd.top < wndheight*(62/100.0)) {
+		state.resize.y = RESIZE_CENTER;
+		state.offset.y = pt.y-mdiclientpt.y;
+		}
+		else {
+		state.resize.y = RESIZE_BOTTOM;
+		state.offset.y = wnd.bottom-pt.y;
+		}
+
+		// Set window right/bottom origin
+		state.origin.right = wnd.right-mdiclientpt.x;
+		state.origin.bottom = wnd.bottom-mdiclientpt.y;
+
+		// Aero-move this window if this is a double-click
+		if (GetTickCount()-state.clicktime <= GetDoubleClickTime()) {
+		sharedstate.action = ACTION_NONE; // Stop resize action
+		state.clicktime = 0; // Reset double-click time
+		state.blockmouseup = 1; // Block the mouseup, otherwise it can trigger a context menu (e.g. in explorer, or on the desktop)
+
+		// Get and set new position
+		int posx, posy, wndwidth, wndheight;
+		wndwidth = max(min((mon.right-mon.left)/2, state.mmi.ptMaxTrackSize.x), state.mmi.ptMinTrackSize.x);
+		wndheight = max(min((mon.bottom-mon.top)/2, state.mmi.ptMaxTrackSize.y), state.mmi.ptMinTrackSize.y);
+		posx = mon.left;
+		posy = mon.top;
+		if (state.resize.y == RESIZE_CENTER) {
+		wndheight = max(min((mon.bottom-mon.top), state.mmi.ptMaxTrackSize.y), state.mmi.ptMinTrackSize.y);
+		posy += (mon.bottom-mon.top)/2-wndheight/2;
+		}
+		else if (state.resize.y == RESIZE_BOTTOM) {
+		posy = mon.bottom-wndheight;
+		}
+		if (state.resize.x == RESIZE_CENTER && state.resize.y != RESIZE_CENTER) {
+		wndwidth = max(min((mon.right-mon.left), state.mmi.ptMaxTrackSize.x), state.mmi.ptMinTrackSize.x);
+		posx += (mon.right-mon.left)/2-wndwidth/2;
+		}
+		else if (state.resize.x == RESIZE_CENTER) {
+		wndwidth = wnd.right-wnd.left;
+		posx = wnd.left-mdiclientpt.x;
+		}
+		else if (state.resize.x == RESIZE_RIGHT) {
+		posx = mon.right-wndwidth;
+		}
+		MoveWindow(state.hwnd, posx, posy, wndwidth, wndheight, TRUE);
+
+		// Get new size after move
+		// Doing this since wndwidth and wndheight might be wrong if the window is resized in chunks (e.g. PuTTY)
+		GetWindowRect(state.hwnd, &wnd);
+		// Update wndentry
+		state.wndentry->last.width = wnd.right-wnd.left;
+		state.wndentry->last.height = wnd.bottom-wnd.top;
+		if (!state.wndentry->restore) {
+		state.wndentry->width = state.origin.width;
+		state.wndentry->height = state.origin.height;
+		state.wndentry->restore = 1;
+		}
+
+		// Prevent mousedown from propagating
+		return 1;
+		}
+
+		// Set cursor
+		if (sharedsettings.Performance.Cursor) {
+		if ((state.resize.y == RESIZE_TOP && state.resize.x == RESIZE_LEFT)
+		|| (state.resize.y == RESIZE_BOTTOM && state.resize.x == RESIZE_RIGHT)) {
+		cursor = cursors[SIZENWSE];
+		}
+		else if ((state.resize.y == RESIZE_TOP && state.resize.x == RESIZE_RIGHT)
+		|| (state.resize.y == RESIZE_BOTTOM && state.resize.x == RESIZE_LEFT)) {
+		cursor = cursors[SIZENESW];
+		}
+		else if ((state.resize.y == RESIZE_TOP && state.resize.x == RESIZE_CENTER)
+		|| (state.resize.y == RESIZE_BOTTOM && state.resize.x == RESIZE_CENTER)) {
+		cursor = cursors[SIZENS];
+		}
+		else if ((state.resize.y == RESIZE_CENTER && state.resize.x == RESIZE_LEFT)
+		|| (state.resize.y == RESIZE_CENTER && state.resize.x == RESIZE_RIGHT)) {
+		cursor = cursors[SIZEWE];
+		}
+		else {
+		cursor = cursors[SIZEALL];
+		}
+		}
+		}
+		else if (action == ACTION_MINIMIZE) {
+		SendMessage(state.hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+		}
+		else if (action == ACTION_CENTER) {
+		MoveWindow(state.hwnd, mon.left+(mon.right-mon.left)/2-state.origin.width/2, mon.top+(mon.bottom-mon.top)/2-state.origin.height/2, state.origin.width, state.origin.height, TRUE);
+		}
+		else if (action == ACTION_ALWAYSONTOP) {
+		LONG_PTR topmost = GetWindowLongPtr(state.hwnd,GWL_EXSTYLE)&WS_EX_TOPMOST;
+		SetWindowPos(state.hwnd, (topmost?HWND_NOTOPMOST:HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE);
+		}
+		else if (action == ACTION_CLOSE) {
+		SendMessage(state.hwnd, WM_CLOSE, 0, 0);
+		}
+		else if (action == ACTION_LOWER) {
+		if (sharedstate.shift) {
+		SendMessage(state.hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+		}
+		else {
+		SetWindowPos(state.hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOACTIVATE|SWP_NOMOVE|SWP_NOSIZE);
+		}
+		}
+
+		// Send WM_ENTERSIZEMOVE and prepare update timer
+		if (action == ACTION_MOVE || action == ACTION_RESIZE) {
+		// Don't send WM_ENTERSIZEMOVE if the window is iTunes
+		wchar_t classname[30] = L"";
+		GetClassName(state.hwnd, classname, ARRAY_SIZE(classname));
+		if (wcscmp(classname,L"iTunes")) {
+		SendMessage(state.hwnd, WM_ENTERSIZEMOVE, 0, 0);
+		}
+		// Prepare update timer
+		state.updaterate = 0;
+		if ((action == ACTION_MOVE   && sharedsettings.Performance.MoveRate > 1)
+		|| (action == ACTION_RESIZE && sharedsettings.Performance.ResizeRate > 1)) {
+		SetTimer(g_hwnd, MOVE_TIMER, 100, NULL);
+		}
+		}
+
+		// We have to send the ctrl keys here too because of IE (and maybe some other program?)
+		state.ignorectrl = 1;
+		KEYBDINPUT ctrl[2] = {{VK_CONTROL,0,0,0}, {VK_CONTROL,0,KEYEVENTF_KEYUP,0}};
+		ctrl[0].dwExtraInfo = ctrl[1].dwExtraInfo = GetMessageExtraInfo();
+		INPUT input[2] = {{INPUT_KEYBOARD,{.ki=ctrl[0]}}, {INPUT_KEYBOARD,{.ki=ctrl[1]}}};
+		SendInput(2, input, sizeof(INPUT));
+		state.ignorectrl = 0;
+
+		// Remember time of this click so we can check for double-click
+		state.clicktime = GetTickCount();
+		state.clickpt = pt;
+
+		// Update cursor
+		if (sharedsettings.Performance.Cursor && cursor != NULL) {
+		MoveWindow(cursorwnd, pt.x-20, pt.y-20, 41, 41, FALSE);
+		SetClassLongPtr(cursorwnd, GCLP_HCURSOR, (LONG_PTR)cursor);
+		ShowWindowAsync(cursorwnd, SW_SHOWNA);
+		}
+
+		// Prevent mousedown from propagating
+		return 1;
+		}
+		else if (buttonstate == STATE_UP && state.blockmouseup) {
+		state.blockmouseup = 0;
+		return 1;
+		}
+		else if (buttonstate == STATE_UP && sharedstate.action == action) {
+		sharedstate.action = ACTION_NONE;
+
+		// Send WM_EXITSIZEMOVE
+		if (action == ACTION_MOVE || action == ACTION_RESIZE) {
+		// Don't send WM_EXITSIZEMOVE if the window is iTunes
+		wchar_t classname[30] = L"";
+		GetClassName(state.hwnd, classname, ARRAY_SIZE(classname));
+		if (wcscmp(classname,L"iTunes")) {
+		SendMessage(state.hwnd, WM_EXITSIZEMOVE, 0, 0);
+		}
+		}
+
+		// Unhook mouse?
+		if (!state.alt) {
+		UnhookMouse();
+		}
+
+		// Hide cursorwnd
+		if (sharedsettings.Performance.Cursor) {
+		ShowWindowAsync(cursorwnd, SW_HIDE);
+		}
+
+		// Prevent mouseup from propagating
+		return 1;
+		}
+#endif
+	  }
+#if ( HOOKS_DBG_SCROLL )
+	{
+		FILE *f = OpenLog( L"ab" );
+		fwprintf( f, L"%u: Retunr to next Hook. \n", tMsNow_u32 );
+		CloseLog( f );
+	}
+#endif
+	  return CallNextHookEx(NULL, nCode, wParam, lParam);
 }
 
+
+/* **************************************************************** */
 int HookMouse() {
   // Check if mouse hook has become stale
   if (sharedsettings.InactiveScroll || sharedsettings.LowerWithMMB) {
@@ -2055,6 +2558,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 #endif
 
+
+/* **************************************************************** */
 // Msghook
 __declspec(dllexport) LRESULT CALLBACK CustomWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
   if (unload) {
@@ -2102,6 +2607,8 @@ __declspec(dllexport) LRESULT CALLBACK CustomWndProc(HWND hwnd, UINT msg, WPARAM
   return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
 
+
+/* **************************************************************** */
 // CallWndProc is called in the context of the thread that calls SendMessage, not the thread that receives the message.
 // Thus we have to explicitly share the memory we want CallWndProc to be able to access (e.g. sharedstate)
 // Variables that are not shared, e.g. the blacklist, are loaded individually for each process.
@@ -2219,6 +2726,8 @@ __declspec(dllexport) LRESULT CALLBACK CallWndProc(int nCode, WPARAM wParam, LPA
   return CallNextHookEx(NULL, nCode, wParam, lParam);
 }
 
+
+/* **************************************************************** */
 __declspec(dllexport) void Unload() {
   sharedsettings_loaded = 0;
   unload = 1;

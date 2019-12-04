@@ -56,7 +56,7 @@ GUID my_IID_IAudioEndpointVolume = {0x5CDF2C82,0x841E,0x4546,{0x97,0x22,0x0C,0xF
 #define AERO_THRESHOLD 5
 
 /** true: Output of log messages regarding scrolling through mouse key pressed moving. */
-#define HOOKS_DBG_SCROLL	true
+#define HOOKS_DBG_SCROLL	false
 
 // Boring stuff
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
